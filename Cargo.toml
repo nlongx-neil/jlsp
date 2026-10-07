@@ -1,0 +1,21 @@
+[package]
+name = "jlsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.43", features = ["full"] }
+tower-lsp = "0.20"
+tree-sitter = "0.25"
+tree-sitter-java = "0.23"
+cafebabe = "0.9"
+zip = "2.2"
+byteorder = "1.5"
+dashmap = "6.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.5"
+quick-xml = { version = "0.37", features = ["serialize"] }
+bincode = "1.3"

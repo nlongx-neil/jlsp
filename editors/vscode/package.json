@@ -1,0 +1,38 @@
+{
+  "name": "jlsp-vscode",
+  "displayName": "jlsp (JVM-free Java Language Support)",
+  "description": "Blazing fast Java LSP for VS Code powered by Rust, with 0 JVM dependencies.",
+  "version": "1.0.0",
+  "publisher": "jlsp",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:java"
+  ],
+  "main": "./client/out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "java",
+        "extensions": [
+          ".java"
+        ]
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "jlsp",
+      "properties": {
+        "jlsp.serverPath": {
+          "type": "string",
+          "default": "jlsp",
+          "description": "Path to jlsp native binary."
+        }
+      }
+    }
+  }
+}

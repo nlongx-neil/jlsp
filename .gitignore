@@ -1,0 +1,5 @@
+/target
+dist
+docs
+.github
+Cargo.lock
