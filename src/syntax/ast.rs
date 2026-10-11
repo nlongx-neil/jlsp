@@ -1,7 +1,136 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 use crate::model::{ClassInfo, ClassKind, FieldInfo, MethodInfo, Position, Range, SymbolDef, SymbolKind, TypeSignature};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverStep {
+    Identifier(String),
+    MethodCall { name: String, arg_count: usize },
+    FieldAccess(String),
+    This,
+    Super,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberAccessInfo {
+    pub receiver: Option<String>,
+    pub receiver_steps: Vec<ReceiverStep>,
+    pub member_name: String,
+    pub is_method: bool,
+    pub arg_count: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvocationArgInfo {
+    pub receiver_steps: Vec<ReceiverStep>,
+    pub receiver_raw: Option<String>,
+    pub method_name: String,
+    pub arg_index: usize,
+    pub total_args: usize,
+    pub position: Position,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticCode {
+    SyntaxError,
+    TypeMismatch,
+    MissingReturn,
+    UnexpectedReturn,
+    FinalReassignment,
+    DuplicateVariable,
+    StaticContextViolation,
+    UnhandledException,
+    InaccessibleMember,
+    UnreachableCode,
+    NullDereference,
+    SwitchMissingDefault,
+    UnusedVariable,
+    UnimplementedAbstractMethod,
+    UnresolvedImport,
+    PublicClassNameMismatch,
+    UninitializedVariable,
+    SpringTransactionalPrivate,
+    SpringPathVariableMismatch,
+    UnusedPrivateMember,
+    MissingOverride,
+    StaticMemberViaInstance,
+    UnusedParameter,
+    StringConcatInLoop,
+}
+
+impl DiagnosticCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DiagnosticCode::SyntaxError => "compiler.err.syntax",
+            DiagnosticCode::TypeMismatch => "compiler.err.prob.found.req",
+            DiagnosticCode::MissingReturn => "compiler.err.missing.ret.stmt",
+            DiagnosticCode::UnexpectedReturn => "compiler.err.unexpected.ret",
+            DiagnosticCode::FinalReassignment => "compiler.err.cant.assign.val.to.final.var",
+            DiagnosticCode::DuplicateVariable => "compiler.err.already.defined",
+            DiagnosticCode::StaticContextViolation => "compiler.err.non-static.cant.be.ref",
+            DiagnosticCode::UnhandledException => "compiler.err.unreported.exception.need.to.catch.or.throw",
+            DiagnosticCode::InaccessibleMember => "compiler.err.report.access",
+            DiagnosticCode::UnreachableCode => "compiler.err.unreachable.stmt",
+            DiagnosticCode::NullDereference => "compiler.err.null.deref",
+            DiagnosticCode::SwitchMissingDefault => "compiler.warn.switch.incomplete",
+            DiagnosticCode::UnusedVariable => "compiler.warn.unused",
+            DiagnosticCode::UnusedPrivateMember => "compiler.warn.unused",
+            DiagnosticCode::MissingOverride => "compiler.warn.missing.override",
+            DiagnosticCode::StaticMemberViaInstance => "compiler.warn.static.access",
+            DiagnosticCode::UnusedParameter => "compiler.warn.unused.parameter",
+            DiagnosticCode::StringConcatInLoop => "performance.warn.string.concat.in.loop",
+            DiagnosticCode::UnimplementedAbstractMethod => "compiler.err.does.not.override.abstract",
+            DiagnosticCode::UnresolvedImport => "compiler.err.cant.resolve",
+            DiagnosticCode::PublicClassNameMismatch => "compiler.err.public.class.must.be.in.file",
+            DiagnosticCode::UninitializedVariable => "compiler.err.var.might.not.have.been.initialized",
+            DiagnosticCode::SpringTransactionalPrivate => "spring.warn.transactional.private",
+            DiagnosticCode::SpringPathVariableMismatch => "spring.warn.pathvariable.mismatch",
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        !matches!(
+            self,
+            DiagnosticCode::UnusedVariable
+                | DiagnosticCode::UnusedPrivateMember
+                | DiagnosticCode::MissingOverride
+                | DiagnosticCode::StaticMemberViaInstance
+                | DiagnosticCode::UnusedParameter
+                | DiagnosticCode::StringConcatInLoop
+                | DiagnosticCode::SwitchMissingDefault
+                | DiagnosticCode::SpringTransactionalPrivate
+                | DiagnosticCode::SpringPathVariableMismatch
+        )
+    }
+
+    pub fn is_unnecessary(&self) -> bool {
+        matches!(
+            self,
+            DiagnosticCode::UnusedVariable
+                | DiagnosticCode::UnusedPrivateMember
+                | DiagnosticCode::UnusedParameter
+                | DiagnosticCode::UnreachableCode
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticDiagnostic {
+    pub range: Range,
+    pub message: String,
+    pub code: DiagnosticCode,
+}
+
+thread_local! {
+    static TS_PARSER: RefCell<Parser> = RefCell::new({
+        let mut parser = Parser::new();
+        let _ = parser.set_language(&tree_sitter_java::LANGUAGE.into());
+        parser
+    });
+}
+
+#[derive(Clone)]
 pub struct JavaAst {
     pub tree: Tree,
     pub source: Arc<String>,
@@ -9,10 +138,18 @@ pub struct JavaAst {
 
 impl JavaAst {
     pub fn parse(source: Arc<String>) -> Option<Self> {
-        let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_java::LANGUAGE.into()).ok()?;
-        let tree = parser.parse(source.as_bytes(), None)?;
-        Some(Self { tree, source })
+        Self::parse_incremental(source, None)
+    }
+
+    pub fn parse_incremental(source: Arc<String>, _old_tree: Option<&Tree>) -> Option<Self> {
+        TS_PARSER.with(|parser_cell| {
+            let mut parser = parser_cell.borrow_mut();
+            // In LSP FULL sync, the whole document text is replaced without Tree-sitter input_edit.
+            // Passing an unedited old_tree causes Tree-sitter to reuse old node byte ranges that desync with new source.
+            // Always parse cleanly with None to guarantee byte ranges match source.
+            let tree = parser.parse(source.as_bytes(), None)?;
+            Some(Self { tree, source })
+        })
     }
 
     pub fn node_text<'a>(&'a self, node: &Node) -> &'a str {
@@ -21,19 +158,83 @@ impl JavaAst {
         &self.source[start..end]
     }
 
-    pub fn node_range(&self, node: &Node) -> Range {
-        let start = node.start_position();
-        let end = node.end_position();
-        Range {
-            start: Position {
-                line: start.row as u32,
-                character: start.column as u32,
-            },
-            end: Position {
-                line: end.row as u32,
-                character: end.column as u32,
-            },
+    /// Convert a line's byte column offset to UTF-16 code unit offset (LSP specification compliance)
+    pub fn byte_col_to_utf16(&self, line: u32, byte_col: usize) -> u32 {
+        if let Some(line_str) = self.source.lines().nth(line as usize) {
+            let mut current_byte = 0;
+            let mut utf16_units = 0;
+            for ch in line_str.chars() {
+                if current_byte >= byte_col {
+                    break;
+                }
+                current_byte += ch.len_utf8();
+                utf16_units += ch.len_utf16() as u32;
+            }
+            utf16_units
+        } else {
+            byte_col as u32
         }
+    }
+
+    /// Convert a line's UTF-16 code unit offset to byte column offset (Tree-sitter Point compliance)
+    pub fn utf16_col_to_byte(&self, line: u32, utf16_col: u32) -> usize {
+        if let Some(line_str) = self.source.lines().nth(line as usize) {
+            let mut current_utf16 = 0;
+            let mut byte_offset = 0;
+            for ch in line_str.chars() {
+                if current_utf16 >= utf16_col {
+                    break;
+                }
+                current_utf16 += ch.len_utf16() as u32;
+                byte_offset += ch.len_utf8();
+            }
+            byte_offset
+        } else {
+            utf16_col as usize
+        }
+    }
+
+    /// Convert Tree-sitter Point to LSP Position with UTF-16 code unit alignment
+    pub fn point_to_position(&self, pt: tree_sitter::Point) -> Position {
+        Position {
+            line: pt.row as u32,
+            character: self.byte_col_to_utf16(pt.row as u32, pt.column),
+        }
+    }
+
+    pub fn node_range(&self, node: &Node) -> Range {
+        Range {
+            start: self.point_to_position(node.start_position()),
+            end: self.point_to_position(node.end_position()),
+        }
+    }
+
+    /// Find AST node at specific LSP position (line, UTF-16 character) with ERROR node recovery
+    pub fn find_node_with_recovery(&self, line: u32, character: u32) -> Option<Node<'_>> {
+        let root = self.tree.root_node();
+        let byte_col = self.utf16_col_to_byte(line, character);
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: byte_col,
+        };
+        
+        let node = root.descendant_for_point_range(point, point)?;
+
+        // If the matched node is an ERROR node, recover by finding the nearest preceding named token or leaf
+        if node.kind() == "ERROR" {
+            let mut cursor = node.walk();
+            let mut best_child = None;
+            for child in node.children(&mut cursor) {
+                if child.start_position().row <= point.row && child.start_position().column <= point.column {
+                    best_child = Some(child);
+                }
+            }
+            if let Some(bc) = best_child {
+                return Some(bc);
+            }
+        }
+
+        Some(node)
     }
 
     /// Extract package declaration if any, e.g. "com.example.app"
@@ -49,16 +250,42 @@ impl JavaAst {
         None
     }
 
-    /// Extract import declarations, e.g. ["java.util.List", "java.util.Map"]
-    pub fn extract_imports(&self) -> Vec<String> {
+    /// Extract package declaration with its Range
+    pub fn extract_package_with_range(&self) -> Option<(tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "package_declaration"
+                && let Some(id_node) = child.children(&mut child.walk()).find(|n| n.kind() == "scoped_identifier" || n.kind() == "identifier") {
+                    return Some((self.node_lsp_range(&child), self.node_text(&id_node).to_string()));
+                }
+        }
+        None
+    }
+
+    /// Extract import declarations with their exact source ranges (supporting static and wildcard imports)
+    pub fn extract_imports_with_ranges(&self) -> Vec<(Range, String)> {
         let root = self.tree.root_node();
         let mut imports = Vec::new();
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             if child.kind() == "import_declaration" {
+                let is_static = child.children(&mut child.walk()).any(|c| c.kind() == "static");
+                let has_asterisk = child.children(&mut child.walk()).any(|c| c.kind() == "asterisk");
                 for node in child.children(&mut child.walk()) {
                     if node.kind() == "scoped_identifier" || node.kind() == "identifier" {
-                        imports.push(self.node_text(&node).to_string());
+                        let base_text = self.node_text(&node);
+                        let with_wildcard = if has_asterisk {
+                            format!("{}.*", base_text)
+                        } else {
+                            base_text.to_string()
+                        };
+                        let full_import = if is_static {
+                            format!("static {}", with_wildcard)
+                        } else {
+                            with_wildcard
+                        };
+                        imports.push((self.node_range(&node), full_import));
                     }
                 }
             }
@@ -66,14 +293,102 @@ impl JavaAst {
         imports
     }
 
+    /// Extract import declarations, e.g. ["java.util.List", "java.util.Map"]
+    pub fn extract_imports(&self) -> Vec<String> {
+        self.extract_imports_with_ranges().into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// Calculate the line to insert a new import statement.
+    /// Never insert before the package declaration.
+    /// If there are existing imports, insert after the last import.
+    /// If no imports but package exists, insert on the line after package.
+    /// Otherwise, insert at line 0.
+    pub fn find_import_insertion_position(&self) -> (Position, bool) {
+        let root = self.tree.root_node();
+        let mut last_import_end: Option<tree_sitter::Point> = None;
+        let mut package_end: Option<tree_sitter::Point> = None;
+
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "package_declaration" {
+                package_end = Some(child.end_position());
+            } else if child.kind() == "import_declaration" {
+                last_import_end = Some(child.end_position());
+            }
+        }
+
+        if let Some(pt) = last_import_end {
+            // Insert after the last import (on the line immediately following)
+            (Position { line: pt.row as u32 + 1, character: 0 }, false)
+        } else if let Some(pt) = package_end {
+            // Insert after the package statement, adding an empty newline for clarity if needed
+            (Position { line: pt.row as u32 + 1, character: 0 }, true)
+        } else {
+            (Position { line: 0, character: 0 }, false)
+        }
+    }
+
+    /// Calculate the replacement range for all existing imports, or the insertion range if none exist.
+    pub fn find_imports_replacement_range(&self) -> (Range, Option<String>) {
+        let root = self.tree.root_node();
+        let mut first_import: Option<tree_sitter::Point> = None;
+        let mut last_import: Option<tree_sitter::Point> = None;
+        let mut package_end: Option<tree_sitter::Point> = None;
+
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "package_declaration" {
+                package_end = Some(child.end_position());
+            } else if child.kind() == "import_declaration" {
+                if first_import.is_none() {
+                    first_import = Some(child.start_position());
+                }
+                last_import = Some(child.end_position());
+            }
+        }
+
+        if let (Some(start_pt), Some(end_pt)) = (first_import, last_import) {
+            (
+                Range {
+                    start: Position { line: start_pt.row as u32, character: 0 },
+                    end: Position { line: end_pt.row as u32 + 1, character: 0 },
+                },
+                None,
+            )
+        } else if let Some(pkg_pt) = package_end {
+            (
+                Range {
+                    start: Position { line: pkg_pt.row as u32 + 1, character: 0 },
+                    end: Position { line: pkg_pt.row as u32 + 1, character: 0 },
+                },
+                Some("\n".to_string()),
+            )
+        } else {
+            (
+                Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 0 },
+                },
+                None,
+            )
+        }
+    }
+
     /// Analyze used identifier tokens and clean up imports:
-    /// Returns sorted, unique, and referenced imports
+    /// Returns sorted, unique, and referenced imports (preserving wildcards and static imports)
     pub fn organize_imports(&self) -> Vec<String> {
         let current_imports = self.extract_imports();
         let mut used_imports = Vec::new();
 
         for imp in current_imports {
-            let simple_name = imp.split('.').last().unwrap_or(&imp);
+            if imp.contains('*') {
+                // Wildcard imports must always be preserved
+                used_imports.push(imp);
+                continue;
+            }
+
+            let clean_imp = imp.strip_prefix("static ").unwrap_or(&imp);
+            let simple_name = clean_imp.split('.').last().unwrap_or(clean_imp);
             // Check if simple_name appears in file body
             let occs = self.find_all_occurrences(simple_name);
             // If it appears more than once (once is the import statement itself), it's used
@@ -85,6 +400,29 @@ impl JavaAst {
         used_imports.sort();
         used_imports.dedup();
         used_imports
+    }
+
+    /// Find unused import declarations with their exact ranges
+    pub fn find_unused_imports(&self) -> Vec<(String, tower_lsp::lsp_types::Range)> {
+        let root = self.tree.root_node();
+        let mut unused = Vec::new();
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "import_declaration" {
+                let import_text = self.node_text(&child);
+                if import_text.contains('*') {
+                    continue;
+                }
+                let clean = import_text.trim_start_matches("import ").trim_end_matches(';').trim();
+                let clean_no_static = clean.strip_prefix("static ").unwrap_or(clean);
+                let simple_name = clean_no_static.split('.').last().unwrap_or(clean_no_static);
+                let occs = self.find_all_occurrences(simple_name);
+                if occs.len() <= 1 {
+                    unused.push((clean.to_string(), self.node_lsp_range(&child)));
+                }
+            }
+        }
+        unused
     }
 
     /// Extract document symbols (Classes, Interfaces, Enums, Methods, Fields)
@@ -166,6 +504,126 @@ impl JavaAst {
         }
     }
 
+    /// Convert AST node Range into tower_lsp::lsp_types::Range with UTF-16 column positioning
+    pub fn node_lsp_range(&self, node: &tree_sitter::Node) -> tower_lsp::lsp_types::Range {
+        let r = self.node_range(node);
+        tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: r.start.line,
+                character: r.start.character,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: r.end.line,
+                character: r.end.character,
+            },
+        }
+    }
+
+    /// Extract nested hierarchical document symbols (Package -> Class -> Methods / Fields)
+    pub fn extract_hierarchical_symbols(&self) -> Vec<tower_lsp::lsp_types::DocumentSymbol> {
+        let mut symbols = Vec::new();
+        let root = self.tree.root_node();
+        self.collect_hierarchical_symbols(root, &mut symbols);
+        symbols
+    }
+
+    fn collect_hierarchical_symbols(&self, node: Node, out: &mut Vec<tower_lsp::lsp_types::DocumentSymbol>) {
+        let kind = node.kind();
+        match kind {
+            "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration" | "annotation_type_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = self.node_text(&name_node).to_string();
+                    let sym_kind = match kind {
+                        "class_declaration" => tower_lsp::lsp_types::SymbolKind::CLASS,
+                        "interface_declaration" | "annotation_type_declaration" => tower_lsp::lsp_types::SymbolKind::INTERFACE,
+                        "enum_declaration" => tower_lsp::lsp_types::SymbolKind::ENUM,
+                        _ => tower_lsp::lsp_types::SymbolKind::CLASS,
+                    };
+
+                    let mut children = Vec::new();
+                    if let Some(body) = node.child_by_field_name("body") {
+                        let mut cursor = body.walk();
+                        for child in body.children(&mut cursor) {
+                            self.collect_hierarchical_symbols(child, &mut children);
+                        }
+                    }
+
+                    #[allow(deprecated)]
+                    out.push(tower_lsp::lsp_types::DocumentSymbol {
+                        name,
+                        detail: Some(kind.replace("_declaration", "")),
+                        kind: sym_kind,
+                        tags: None,
+                        deprecated: None,
+                        range: self.node_lsp_range(&node),
+                        selection_range: self.node_lsp_range(&name_node),
+                        children: if children.is_empty() { None } else { Some(children) },
+                    });
+                }
+            }
+            "constructor_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = self.node_text(&name_node).to_string();
+                    #[allow(deprecated)]
+                    out.push(tower_lsp::lsp_types::DocumentSymbol {
+                        name,
+                        detail: Some("constructor".to_string()),
+                        kind: tower_lsp::lsp_types::SymbolKind::CONSTRUCTOR,
+                        tags: None,
+                        deprecated: None,
+                        range: self.node_lsp_range(&node),
+                        selection_range: self.node_lsp_range(&name_node),
+                        children: None,
+                    });
+                }
+            }
+            "method_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = self.node_text(&name_node).to_string();
+                    let ret_type = node.child_by_field_name("type").map(|n| self.node_text(&n)).unwrap_or("void");
+                    #[allow(deprecated)]
+                    out.push(tower_lsp::lsp_types::DocumentSymbol {
+                        name,
+                        detail: Some(ret_type.to_string()),
+                        kind: tower_lsp::lsp_types::SymbolKind::METHOD,
+                        tags: None,
+                        deprecated: None,
+                        range: self.node_lsp_range(&node),
+                        selection_range: self.node_lsp_range(&name_node),
+                        children: None,
+                    });
+                }
+            }
+            "field_declaration" => {
+                let ty = node.child_by_field_name("type").map(|n| self.node_text(&n).to_string()).unwrap_or_default();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "variable_declarator"
+                        && let Some(name_node) = child.child_by_field_name("name") {
+                            let name = self.node_text(&name_node).to_string();
+                            #[allow(deprecated)]
+                            out.push(tower_lsp::lsp_types::DocumentSymbol {
+                                name,
+                                detail: Some(ty.clone()),
+                                kind: tower_lsp::lsp_types::SymbolKind::FIELD,
+                                tags: None,
+                                deprecated: None,
+                                range: self.node_lsp_range(&node),
+                                selection_range: self.node_lsp_range(&name_node),
+                                children: None,
+                            });
+                        }
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.collect_hierarchical_symbols(child, out);
+                }
+            }
+        }
+    }
+
     /// Convert parsed AST class into ClassInfo representation for semantic indexing
     pub fn extract_classes(&self, file_path: Option<String>) -> Vec<ClassInfo> {
         let pkg = self.extract_package().unwrap_or_default();
@@ -206,7 +664,7 @@ impl JavaAst {
                                     super_class = Some(clean.to_string());
                                 }
                             }
-                        } else if c_child.kind() == "super_interfaces" {
+                        } else if c_child.kind() == "super_interfaces" || c_child.kind() == "extends_interfaces" {
                             let mut if_cursor = c_child.walk();
                             for if_child in c_child.children(&mut if_cursor) {
                                 if if_child.kind() == "type_list" || if_child.kind() == "interface_type_list" {
@@ -245,6 +703,7 @@ impl JavaAst {
                                             field_type: TypeSignature::Class(p_type.to_string()),
                                             is_static: false,
                                             is_public: false,
+                                            is_final: true,
                                         });
 
                                         // Record components generate canonical accessor: e.g. id() -> Long
@@ -256,6 +715,7 @@ impl JavaAst {
                                             is_public: true,
                                             is_constructor: false,
                                             javadoc: Some("Generated canonical record accessor".into()),
+                                            body: None,
                                         });
                                     }
                                 }
@@ -266,11 +726,16 @@ impl JavaAst {
                     if let Some(body) = child.child_by_field_name("body") {
                         let mut b_cursor = body.walk();
                         for m_child in body.children(&mut b_cursor) {
-                            if m_child.kind() == "method_declaration" {
+                            if m_child.kind() == "method_declaration" || m_child.kind() == "constructor_declaration" {
                                 if let Some(m_name_node) = m_child.child_by_field_name("name") {
                                     let m_name = self.node_text(&m_name_node).to_string();
-                                    let ret_str = m_child.child_by_field_name("type").map(|t| self.node_text(&t)).unwrap_or("void");
-                                    let ret_type = TypeSignature::Class(ret_str.to_string());
+                                    let is_ctor = m_child.kind() == "constructor_declaration";
+                                    let ret_type = if is_ctor {
+                                        TypeSignature::Void
+                                    } else {
+                                        let ret_str = m_child.child_by_field_name("type").map(|t| self.node_text(&t)).unwrap_or("void");
+                                        TypeSignature::Class(ret_str.to_string())
+                                    };
 
                                     let mut parameters = Vec::new();
                                     if let Some(params_node) = m_child.child_by_field_name("parameters") {
@@ -284,8 +749,21 @@ impl JavaAst {
                                         }
                                     }
 
-                                    let is_static = m_child.children(&mut m_child.walk()).any(|m| self.node_text(&m) == "static");
-                                    let is_public = m_child.children(&mut m_child.walk()).any(|m| self.node_text(&m) == "public");
+                                    let mut is_static = false;
+                                    let mut is_public = false;
+                                    for m_mod in m_child.children(&mut m_child.walk()) {
+                                        let txt = self.node_text(&m_mod);
+                                        if m_mod.kind() == "modifiers" || m_mod.kind() == "modifier" {
+                                            for w in txt.split_whitespace() {
+                                                if w == "static" { is_static = true; }
+                                                if w == "public" { is_public = true; }
+                                            }
+                                        } else if m_mod.kind() == "static" || txt == "static" {
+                                            is_static = true;
+                                        } else if m_mod.kind() == "public" || txt == "public" {
+                                            is_public = true;
+                                        }
+                                    }
                                     
                                     methods.push(MethodInfo {
                                         name: m_name,
@@ -293,8 +771,9 @@ impl JavaAst {
                                         parameters,
                                         is_static,
                                         is_public,
-                                        is_constructor: false,
+                                        is_constructor: is_ctor,
                                         javadoc: None,
+                                        body: None,
                                     });
                                 }
                             } else if m_child.kind() == "annotation_type_element_declaration" {
@@ -310,12 +789,30 @@ impl JavaAst {
                                         is_public: true,
                                         is_constructor: false,
                                         javadoc: None,
+                                        body: None,
                                     });
                                 }
                             } else if m_child.kind() == "field_declaration" {
                                 let f_type_str = m_child.child_by_field_name("type").map(|t| self.node_text(&t)).unwrap_or("Object");
-                                let is_static = m_child.children(&mut m_child.walk()).any(|m| self.node_text(&m) == "static");
-                                let is_public = m_child.children(&mut m_child.walk()).any(|m| self.node_text(&m) == "public");
+                                let mut is_static = false;
+                                let mut is_public = false;
+                                let mut is_final = false;
+                                for f_mod in m_child.children(&mut m_child.walk()) {
+                                    let txt = self.node_text(&f_mod);
+                                    if f_mod.kind() == "modifiers" || f_mod.kind() == "modifier" {
+                                        for w in txt.split_whitespace() {
+                                            if w == "static" { is_static = true; }
+                                            if w == "public" { is_public = true; }
+                                            if w == "final" { is_final = true; }
+                                        }
+                                    } else if f_mod.kind() == "static" || txt == "static" {
+                                        is_static = true;
+                                    } else if f_mod.kind() == "public" || txt == "public" {
+                                        is_public = true;
+                                    } else if f_mod.kind() == "final" || txt == "final" {
+                                        is_final = true;
+                                    }
+                                }
                                 let mut f_cursor = m_child.walk();
                                 for dec in m_child.children(&mut f_cursor) {
                                     if dec.kind() == "variable_declarator"
@@ -325,6 +822,7 @@ impl JavaAst {
                                                 field_type: TypeSignature::Class(f_type_str.to_string()),
                                                 is_static,
                                                 is_public,
+                                                is_final,
                                             });
                                         }
                                 }
@@ -345,6 +843,103 @@ impl JavaAst {
                         is_public: true,
                     });
                 }
+        }
+
+        if classes.is_empty() {
+            // Fault-tolerant text fallback: extract class name and method declarations from source
+            let mut curr_class_name = None;
+            let mut curr_kind = ClassKind::Class;
+            let mut methods = Vec::new();
+            let fields = Vec::new();
+
+            for line in self.source.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                    continue;
+                }
+                for kw in &["@interface ", "interface ", "class ", "enum ", "record "] {
+                    if let Some(idx) = trimmed.find(kw) {
+                        let after = &trimmed[idx + kw.len()..];
+                        let name = after
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !name.is_empty() {
+                            curr_class_name = Some(name.to_string());
+                            curr_kind = match *kw {
+                                "@interface " => ClassKind::Annotation,
+                                "interface " => ClassKind::Interface,
+                                "enum " => ClassKind::Enum,
+                                "record " => ClassKind::Record,
+                                _ => ClassKind::Class,
+                            };
+                            break;
+                        }
+                    }
+                }
+
+                // If inside a class, detect method signatures: e.g. "public void process(User user) {"
+                if let (Some(open), Some(close)) = (trimmed.find('('), trimmed.find(')')) {
+                    if open < close && !trimmed.starts_with("if") && !trimmed.starts_with("while") && !trimmed.starts_with("for") && !trimmed.starts_with("switch") {
+                        let before_paren = trimmed[..open].trim();
+                        let parts: Vec<&str> = before_paren.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let m_name = parts[parts.len() - 1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                            let ret_type_str = parts[parts.len() - 2];
+                            if !m_name.is_empty() && !ret_type_str.is_empty() {
+                                let mut params = Vec::new();
+                                let inside = &trimmed[open + 1..close];
+                                for param in inside.split(',') {
+                                    let p_parts: Vec<&str> = param.split_whitespace().collect();
+                                    if p_parts.len() >= 2 {
+                                        let p_type = p_parts[p_parts.len() - 2];
+                                        let p_name = p_parts[p_parts.len() - 1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                                        if !p_name.is_empty() {
+                                            params.push((p_name.to_string(), TypeSignature::Class(p_type.to_string())));
+                                        }
+                                    }
+                                }
+                                let ret_sig = if ret_type_str == "void" {
+                                    TypeSignature::Void
+                                } else {
+                                    TypeSignature::Class(ret_type_str.to_string())
+                                };
+                                methods.push(MethodInfo {
+                                    name: m_name.to_string(),
+                                    return_type: ret_sig,
+                                    parameters: params,
+                                    is_static: parts.contains(&"static"),
+                                    is_public: parts.contains(&"public"),
+                                    is_constructor: false,
+                                    javadoc: None,
+                                    body: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(simple_name) = curr_class_name {
+                let fqn = if pkg.is_empty() {
+                    simple_name.clone()
+                } else {
+                    format!("{}.{}", pkg, simple_name)
+                };
+                classes.push(ClassInfo {
+                    fqn,
+                    simple_name,
+                    package_name: pkg.clone(),
+                    kind: curr_kind,
+                    super_class: None,
+                    interfaces: Vec::new(),
+                    methods,
+                    fields,
+                    source_path: file_path,
+                    is_public: true,
+                });
+            }
         }
 
         classes
@@ -379,12 +974,71 @@ impl JavaAst {
         errors
     }
 
-    /// Perform fast AST-level semantic checks (Type mismatches, invalid assignments)
+    /// Perform compiler-grade AST-level semantic checks (Type mismatches, missing returns, final reassignment, static violations, etc.)
     pub fn collect_semantic_diagnostics(&self) -> Vec<(Range, String)> {
+        self.collect_semantic_diagnostics_detailed(None)
+            .into_iter()
+            .map(|d| (d.range, d.message))
+            .collect()
+    }
+
+    /// Perform exhaustive compiler-grade AST semantic checks returning full SemanticDiagnostic items
+    pub fn collect_semantic_diagnostics_detailed(&self, file_name: Option<&str>) -> Vec<SemanticDiagnostic> {
         let mut diags = Vec::new();
         let root = self.tree.root_node();
 
-        fn traverse(node: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<(Range, String)>) {
+        // 1. Check public class name vs file name
+        if let Some(fname) = file_name {
+            let expected_cls = fname.strip_suffix(".java").unwrap_or(fname);
+            let mut cursor = root.walk();
+            for child in root.children(&mut cursor) {
+                if matches!(child.kind(), "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") {
+                    let is_public = child.children(&mut child.walk()).any(|c| (c.kind() == "modifiers" && self.node_text(&c).contains("public")) || self.node_text(&c) == "public");
+                    if is_public {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            let cls_name = self.node_text(&name_node);
+                            if cls_name != expected_cls {
+                                diags.push(SemanticDiagnostic {
+                                    range: self.node_range(&name_node),
+                                    message: format!("Class '{}' is public, should be declared in a file named '{}.java'", cls_name, cls_name),
+                                    code: DiagnosticCode::PublicClassNameMismatch,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect final variables and fields to detect final reassignment
+        let mut final_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+        fn collect_finals(node: tree_sitter::Node, ast: &JavaAst, finals: &mut std::collections::HashSet<String>) {
+            if node.kind() == "local_variable_declaration" || node.kind() == "field_declaration" {
+                let is_final = node.children(&mut node.walk()).any(|c| (c.kind() == "modifiers" && ast.node_text(&c).contains("final")) || ast.node_text(&c) == "final");
+                if is_final {
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.kind() == "variable_declarator" {
+                            if let Some(name_node) = child.child_by_field_name("name") {
+                                finals.insert(ast.node_text(&name_node).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_finals(child, ast, finals);
+            }
+        }
+        collect_finals(root, self, &mut final_vars);
+
+        fn traverse(
+            node: tree_sitter::Node,
+            ast: &JavaAst,
+            final_vars: &std::collections::HashSet<String>,
+            out: &mut Vec<SemanticDiagnostic>,
+        ) {
             // Check local variable declaration type mismatches, e.g. int x = "hello";
             if node.kind() == "local_variable_declaration" {
                 if let Some(ty_node) = node.child_by_field_name("type") {
@@ -408,14 +1062,15 @@ impl JavaAst {
                                 };
 
                                 if incompatible {
-                                    out.push((
-                                        ast.node_range(&val_node),
-                                        format!(
+                                    out.push(SemanticDiagnostic {
+                                        range: ast.node_range(&val_node),
+                                        message: format!(
                                             "Type mismatch: cannot convert from {} literal to '{}'",
                                             val_kind.replace("_literal", ""),
                                             declared_type
                                         ),
-                                    ));
+                                        code: DiagnosticCode::TypeMismatch,
+                                    });
                                 }
                             }
                         }
@@ -423,8 +1078,239 @@ impl JavaAst {
                 }
             }
 
-            // Check for unused local variables in methods
+            // Check final variable reassignment
+            if node.kind() == "assignment_expression" {
+                if let Some(left) = node.child_by_field_name("left") {
+                    if left.kind() == "identifier" {
+                        let name = ast.node_text(&left);
+                        if final_vars.contains(name) {
+                            out.push(SemanticDiagnostic {
+                                range: ast.node_range(&left),
+                                message: format!("Cannot assign a value to final variable '{}'", name),
+                                code: DiagnosticCode::FinalReassignment,
+                            });
+                        }
+                    }
+                }
+            } else if node.kind() == "update_expression" {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "identifier" {
+                        let name = ast.node_text(&child);
+                        if final_vars.contains(name) {
+                            out.push(SemanticDiagnostic {
+                                range: ast.node_range(&child),
+                                message: format!("Cannot assign a value to final variable '{}'", name),
+                                code: DiagnosticCode::FinalReassignment,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Check duplicate variable declaration and uninitialized local variable reads in same block
+            if node.kind() == "block" {
+                let mut block_vars = std::collections::HashSet::new();
+                let mut unassigned_vars: std::collections::HashMap<String, Range> = std::collections::HashMap::new();
+
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "local_variable_declaration" {
+                        let mut v_cursor = child.walk();
+                        for v_child in child.children(&mut v_cursor) {
+                            if v_child.kind() == "variable_declarator" {
+                                if let Some(name_node) = v_child.child_by_field_name("name") {
+                                    let name = ast.node_text(&name_node).to_string();
+                                    if !block_vars.insert(name.clone()) {
+                                        out.push(SemanticDiagnostic {
+                                            range: ast.node_range(&name_node),
+                                            message: format!("Variable '{}' is already defined in scope", name),
+                                            code: DiagnosticCode::DuplicateVariable,
+                                        });
+                                    } else if v_child.child_by_field_name("value").is_none() {
+                                        // Variable declared without initializer: e.g. int x;
+                                        unassigned_vars.insert(name, ast.node_range(&name_node));
+                                    }
+                                }
+                            }
+                        }
+                    } else if child.kind() == "expression_statement" {
+                        // Check if it's an assignment to one of unassigned_vars
+                        let mut assigned_name = None;
+                        if let Some(expr) = child.children(&mut child.walk()).find(|c| c.kind() == "assignment_expression") {
+                            if let Some(left) = expr.child_by_field_name("left") {
+                                if left.kind() == "identifier" {
+                                    assigned_name = Some(ast.node_text(&left).to_string());
+                                }
+                            }
+                        }
+                        if let Some(aname) = assigned_name {
+                            unassigned_vars.remove(&aname);
+                        } else {
+                            // Check if reading any unassigned variable
+                            fn check_reads(
+                                n: tree_sitter::Node,
+                                ast: &JavaAst,
+                                unassigned: &std::collections::HashMap<String, Range>,
+                                out: &mut Vec<SemanticDiagnostic>,
+                            ) {
+                                if n.kind() == "identifier" {
+                                    let id = ast.node_text(&n);
+                                    if unassigned.contains_key(id) {
+                                        let p = n.parent().map(|p| p.kind()).unwrap_or("");
+                                        // Ignore declaration names or assignment left hand side
+                                        if p != "variable_declarator" {
+                                            out.push(SemanticDiagnostic {
+                                                range: ast.node_range(&n),
+                                                message: format!("variable '{}' might not have been initialized", id),
+                                                code: DiagnosticCode::UninitializedVariable,
+                                            });
+                                        }
+                                    }
+                                }
+                                let mut cursor = n.walk();
+                                for ch in n.children(&mut cursor) {
+                                    check_reads(ch, ast, unassigned, out);
+                                }
+                            }
+                            check_reads(child, ast, &unassigned_vars, out);
+                        }
+                    }
+                }
+            }
+
+            // Check for method declarations: return statements, missing return, and static context
             if node.kind() == "method_declaration" {
+                let is_static = node.children(&mut node.walk()).any(|c| (c.kind() == "modifiers" && ast.node_text(&c).contains("static")) || ast.node_text(&c) == "static");
+                let ret_type_opt = node.child_by_field_name("type").map(|t| ast.node_text(&t).trim()).filter(|s| !s.is_empty());
+                let is_abstract = node.children(&mut node.walk()).any(|c| (c.kind() == "modifiers" && ast.node_text(&c).contains("abstract")) || ast.node_text(&c) == "abstract");
+                let is_native = node.children(&mut node.walk()).any(|c| (c.kind() == "modifiers" && ast.node_text(&c).contains("native")) || ast.node_text(&c) == "native");
+                let in_interface = node.parent().map(|p| p.kind() == "interface_declaration" || p.kind() == "annotation_type_declaration").unwrap_or(false);
+
+                if let Some(body) = node.child_by_field_name("body") {
+                    // Static context violation: cannot use this or super in static method
+                    if is_static {
+                        fn check_static_context(n: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<SemanticDiagnostic>) {
+                            if matches!(
+                                n.kind(),
+                                "class_declaration"
+                                    | "interface_declaration"
+                                    | "record_declaration"
+                                    | "enum_declaration"
+                                    | "class_body"
+                                    | "method_declaration"
+                                    | "constructor_declaration"
+                            ) {
+                                return;
+                            }
+                            if n.kind() == "this" || n.kind() == "super" {
+                                out.push(SemanticDiagnostic {
+                                    range: ast.node_range(&n),
+                                    message: format!("Cannot use '{}' in a static context", ast.node_text(&n)),
+                                    code: DiagnosticCode::StaticContextViolation,
+                                });
+                            }
+                            let mut cursor = n.walk();
+                            for child in n.children(&mut cursor) {
+                                check_static_context(child, ast, out);
+                            }
+                        }
+                        check_static_context(body, ast, out);
+                    }
+
+                    // Check return statements compatibility
+                    if let Some(ret_type) = ret_type_opt {
+                        let is_void = ret_type == "void";
+
+                        fn check_returns(n: tree_sitter::Node, ast: &JavaAst, m_ret: &str, is_v: bool, out: &mut Vec<SemanticDiagnostic>) {
+                            if matches!(
+                                n.kind(),
+                                "lambda_expression"
+                                    | "class_declaration"
+                                    | "interface_declaration"
+                                    | "record_declaration"
+                                    | "enum_declaration"
+                                    | "class_body"
+                                    | "method_declaration"
+                                    | "constructor_declaration"
+                            ) {
+                                return;
+                            }
+                            if n.kind() == "return_statement" {
+                                let mut cursor = n.walk();
+                                let expr_child = n.children(&mut cursor).find(|c| c.kind() != "return" && c.kind() != ";" && c.is_named());
+                                if is_v {
+                                    if let Some(expr) = expr_child {
+                                        out.push(SemanticDiagnostic {
+                                            range: ast.node_range(&expr),
+                                            message: "Cannot return a value from a method with void result type".to_string(),
+                                            code: DiagnosticCode::UnexpectedReturn,
+                                        });
+                                    }
+                                } else if let Some(expr) = expr_child {
+                                    let val_kind = expr.kind();
+                                    let incompatible = match m_ret {
+                                        "int" | "long" | "short" | "byte" => matches!(val_kind, "string_literal" | "true" | "false"),
+                                        "boolean" => matches!(val_kind, "string_literal" | "decimal_integer_literal" | "decimal_floating_point_literal"),
+                                        "String" => matches!(val_kind, "decimal_integer_literal" | "decimal_floating_point_literal" | "true" | "false"),
+                                        _ => false,
+                                    };
+                                    if incompatible {
+                                        out.push(SemanticDiagnostic {
+                                            range: ast.node_range(&expr),
+                                            message: format!(
+                                                "Type mismatch: cannot convert from {} literal to '{}'",
+                                                val_kind.replace("_literal", ""),
+                                                m_ret
+                                            ),
+                                            code: DiagnosticCode::TypeMismatch,
+                                        });
+                                    }
+                                }
+                            }
+                            let mut cursor = n.walk();
+                            for child in n.children(&mut cursor) {
+                                check_returns(child, ast, m_ret, is_v, out);
+                            }
+                        }
+                        check_returns(body, ast, ret_type, is_void, out);
+
+                        // Missing return statement check in non-void concrete methods
+                        if !is_void && !is_abstract && !is_native && !in_interface {
+                            fn definitely_returns(stmt: tree_sitter::Node) -> bool {
+                                match stmt.kind() {
+                                    "return_statement" | "throw_statement" => true,
+                                    "block" => {
+                                        let mut cursor = stmt.walk();
+                                        let children: Vec<_> = stmt.children(&mut cursor).filter(|c| c.kind() != "{" && c.kind() != "}").collect();
+                                        children.last().map(|s| definitely_returns(*s)).unwrap_or(false)
+                                    }
+                                    "if_statement" => {
+                                        let cons = stmt.child_by_field_name("consequence");
+                                        let alt = stmt.child_by_field_name("alternative");
+                                        if let (Some(c), Some(a)) = (cons, alt) {
+                                            definitely_returns(c) && definitely_returns(a)
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    _ => false,
+                                }
+                            }
+
+                            if !definitely_returns(body) {
+                                let name_node = node.child_by_field_name("name").unwrap_or(node);
+                                out.push(SemanticDiagnostic {
+                                    range: ast.node_range(&name_node),
+                                    message: format!("Missing return statement in method returning '{}'", ret_type),
+                                    code: DiagnosticCode::MissingReturn,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check for unused local variables in methods
                 let mut declared_vars = Vec::new();
                 let mut all_identifiers = Vec::new();
 
@@ -434,6 +1320,29 @@ impl JavaAst {
                     decls: &mut Vec<(String, Range)>,
                     reads: &mut Vec<String>,
                 ) {
+                    if matches!(
+                        n.kind(),
+                        "class_declaration"
+                            | "interface_declaration"
+                            | "record_declaration"
+                            | "enum_declaration"
+                            | "class_body"
+                            | "method_declaration"
+                            | "constructor_declaration"
+                    ) {
+                        fn collect_reads_only(n: tree_sitter::Node, ast: &JavaAst, reads: &mut Vec<String>) {
+                            if n.kind() == "identifier" {
+                                reads.push(ast.node_text(&n).to_string());
+                            }
+                            let mut cursor = n.walk();
+                            for child in n.children(&mut cursor) {
+                                collect_reads_only(child, ast, reads);
+                            }
+                        }
+                        collect_reads_only(n, ast, reads);
+                        return;
+                    }
+
                     if n.kind() == "variable_declarator" {
                         if let Some(name_node) = n.child_by_field_name("name") {
                             decls.push((ast.node_text(&name_node).to_string(), ast.node_range(&name_node)));
@@ -452,14 +1361,126 @@ impl JavaAst {
                     find_declarations_and_reads(body, ast, &mut declared_vars, &mut all_identifiers);
                 }
 
-                for (var_name, range) in declared_vars {
-                    // Count how many times var_name appears in method body (1 = only declaration itself)
-                    let count = all_identifiers.iter().filter(|id| *id == &var_name).count();
-                    if count <= 1 {
-                        out.push((
-                            range,
-                            format!("The value of the local variable '{}' is not used", var_name),
-                        ));
+                if !declared_vars.is_empty() {
+                    let mut ident_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::with_capacity(all_identifiers.len());
+                    for id in &all_identifiers {
+                        *ident_counts.entry(id.as_str()).or_default() += 1;
+                    }
+
+                    for (var_name, range) in declared_vars {
+                        let count = ident_counts.get(var_name.as_str()).copied().unwrap_or(0);
+                        if count <= 1 {
+                            out.push(SemanticDiagnostic {
+                                range,
+                                message: format!("The value of the local variable '{}' is not used", var_name),
+                                code: DiagnosticCode::UnusedVariable,
+                            });
+                        }
+                    }
+                }
+
+                // Check for unused parameters in private methods
+                let is_private = node.children(&mut node.walk()).any(|c| {
+                    (c.kind() == "modifiers" && ast.node_text(&c).split_whitespace().any(|w| w == "private"))
+                        || ast.node_text(&c) == "private"
+                });
+                if is_private && !in_interface && !is_abstract {
+                    if let Some(params_node) = node.child_by_field_name("parameters") {
+                        let mut p_cursor = params_node.walk();
+                        for param in params_node.children(&mut p_cursor) {
+                            if param.kind() == "formal_parameter" {
+                                if let Some(p_name_node) = param.child_by_field_name("name") {
+                                    let p_name = ast.node_text(&p_name_node);
+                                    let count = all_identifiers.iter().filter(|id| id.as_str() == p_name).count();
+                                    if count == 0 {
+                                        out.push(SemanticDiagnostic {
+                                            range: ast.node_range(&p_name_node),
+                                            message: format!("The parameter '{}' is never read", p_name),
+                                            code: DiagnosticCode::UnusedParameter,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Spring Framework Check 1: @Transactional on private method warning
+                let has_transactional = node.children(&mut node.walk()).any(|c| {
+                    (c.kind() == "modifiers" || c.kind() == "marker_annotation" || c.kind() == "annotation")
+                        && ast.node_text(&c).contains("Transactional")
+                });
+                let is_private = node.children(&mut node.walk()).any(|c| {
+                    (c.kind() == "modifiers" && ast.node_text(&c).split_whitespace().any(|w| w == "private"))
+                        || ast.node_text(&c) == "private"
+                });
+                if has_transactional && is_private {
+                    let name_node = node.child_by_field_name("name").unwrap_or(node);
+                    out.push(SemanticDiagnostic {
+                        range: ast.node_range(&name_node),
+                        message: "Methods annotated with '@Transactional' should be public. Spring AOP proxying ignores private methods.".to_string(),
+                        code: DiagnosticCode::SpringTransactionalPrivate,
+                    });
+                }
+
+                // Spring Framework Check 2: @PathVariable URI template variable consistency
+                let mut uri_vars = Vec::new();
+                for c in node.children(&mut node.walk()) {
+                    let text = ast.node_text(&c);
+                    if (c.kind() == "annotation" || c.kind() == "modifiers") && text.contains("Mapping") {
+                        let mut curr_str = text;
+                        while let Some(open_brace) = curr_str.find('{') {
+                            if let Some(close_brace) = curr_str[open_brace + 1..].find('}') {
+                                let var_name = &curr_str[open_brace + 1..open_brace + 1 + close_brace];
+                                let clean_var = var_name.trim();
+                                if !clean_var.is_empty() {
+                                    uri_vars.push(clean_var.to_string());
+                                }
+                                curr_str = &curr_str[open_brace + 1 + close_brace + 1..];
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !uri_vars.is_empty() {
+                    if let Some(params_node) = node.child_by_field_name("parameters") {
+                        let mut p_cursor = params_node.walk();
+                        for param in params_node.children(&mut p_cursor) {
+                            let p_text = ast.node_text(&param);
+                            if p_text.contains("PathVariable") {
+                                let explicit_name = if let Some(pv_idx) = p_text.find("PathVariable") {
+                                    let after = &p_text[pv_idx..];
+                                    if let Some(q1) = after.find('"') {
+                                        after[q1 + 1..].find('"').map(|q2| after[q1 + 1..q1 + 1 + q2].trim().to_string())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                let target_var = explicit_name.unwrap_or_else(|| {
+                                    param.child_by_field_name("name")
+                                        .map(|n| ast.node_text(&n).to_string())
+                                        .unwrap_or_default()
+                                });
+
+                                if !target_var.is_empty() && !uri_vars.contains(&target_var) {
+                                    let err_node = param.child_by_field_name("name").unwrap_or(param);
+                                    out.push(SemanticDiagnostic {
+                                        range: ast.node_range(&err_node),
+                                        message: format!(
+                                            "Path variable '{}' does not match any URI template variable {{{}}} in mapping annotation",
+                                            target_var,
+                                            uri_vars.join(", ")
+                                        ),
+                                        code: DiagnosticCode::SpringPathVariableMismatch,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -473,21 +1494,26 @@ impl JavaAst {
                         in_try = true;
                         break;
                     }
-                    if parent_node.kind() == "method_declaration" {
-                        // Check if method declares throws
-                        if parent_node.child_by_field_name("throws").is_some() {
+                    if parent_node.kind() == "method_declaration" || parent_node.kind() == "constructor_declaration" {
+                        let throws_node = parent_node.child_by_field_name("throws")
+                            .or_else(|| parent_node.children(&mut parent_node.walk()).find(|c| c.kind() == "throws"));
+                        if throws_node.is_some() {
                             in_try = true;
                         }
+                        break;
+                    }
+                    if parent_node.kind() == "lambda_expression" {
                         break;
                     }
                     p = parent_node.parent();
                 }
 
                 if !in_try {
-                    out.push((
-                        ast.node_range(&node),
-                        "Unhandled exception: type must be caught or declared to be thrown".to_string(),
-                    ));
+                    out.push(SemanticDiagnostic {
+                        range: ast.node_range(&node),
+                        message: "Unhandled exception: type must be caught or declared to be thrown".to_string(),
+                        code: DiagnosticCode::UnhandledException,
+                    });
                 }
             }
 
@@ -496,10 +1522,11 @@ impl JavaAst {
                 if let Some(field_n) = node.child_by_field_name("field") {
                     let field_name = ast.node_text(&field_n);
                     if field_name.starts_with('_') || field_name.contains("private") {
-                        out.push((
-                            ast.node_range(&field_n),
-                            format!("The field '{}' is not visible", field_name),
-                        ));
+                        out.push(SemanticDiagnostic {
+                            range: ast.node_range(&field_n),
+                            message: format!("The field '{}' is not visible", field_name),
+                            code: DiagnosticCode::InaccessibleMember,
+                        });
                     }
                 }
             }
@@ -510,10 +1537,11 @@ impl JavaAst {
                 let mut has_terminated = false;
                 for child in node.children(&mut cursor) {
                     if has_terminated && child.kind() != "}" {
-                        out.push((
-                            ast.node_range(&child),
-                            "Unreachable code: statement will never be executed".to_string(),
-                        ));
+                        out.push(SemanticDiagnostic {
+                            range: ast.node_range(&child),
+                            message: "Unreachable code: statement will never be executed".to_string(),
+                            code: DiagnosticCode::UnreachableCode,
+                        });
                         break;
                     }
                     if child.kind() == "return_statement"
@@ -526,14 +1554,309 @@ impl JavaAst {
                 }
             }
 
-            // Check for explicit null dereference: e.g. null.foo() or Type x = null; x.foo()
+            // Check for explicit null dereference: e.g. null.foo()
             if node.kind() == "method_invocation" {
                 if let Some(obj) = node.child_by_field_name("object") {
                     if ast.node_text(&obj) == "null" {
-                        out.push((
-                            ast.node_range(&node),
-                            "Null pointer dereference: invoking method on null literal".to_string(),
-                        ));
+                        out.push(SemanticDiagnostic {
+                            range: ast.node_range(&node),
+                            message: "Null pointer dereference: invoking method on null literal".to_string(),
+                            code: DiagnosticCode::NullDereference,
+                        });
+                    }
+                }
+
+                // Check for method invocations throwing well-known Checked Exceptions outside try-catch
+                let m_name = node.child_by_field_name("name").map(|n| ast.node_text(&n)).unwrap_or("");
+                let obj_text = node.child_by_field_name("object").map(|o| ast.node_text(&o)).unwrap_or("");
+                let checked_exc = if (obj_text == "Thread" && m_name == "sleep") || m_name == "wait" {
+                    Some("InterruptedException")
+                } else if (obj_text == "Files" && (m_name.starts_with("read") || m_name.starts_with("write") || m_name == "copy" || m_name == "lines"))
+                    || (obj_text.contains("Reader") && m_name == "readLine")
+                    || (obj_text.contains("Stream") && (m_name == "read" || m_name == "write" || m_name == "close")) {
+                    Some("IOException")
+                } else if obj_text == "Class" && m_name == "forName" {
+                    Some("ClassNotFoundException")
+                } else {
+                    None
+                };
+
+                if let Some(exc_name) = checked_exc {
+                    let mut in_try = false;
+                    let mut p = node.parent();
+                    while let Some(parent_node) = p {
+                        if parent_node.kind() == "try_statement" || parent_node.kind() == "try_with_resources_statement" {
+                            let text = ast.node_text(&parent_node);
+                            if text.contains(exc_name) || text.contains("Exception") || text.contains("Throwable") {
+                                in_try = true;
+                                break;
+                            }
+                        }
+                        if parent_node.kind() == "method_declaration" || parent_node.kind() == "constructor_declaration" {
+                            let throws_node = parent_node.child_by_field_name("throws")
+                                .or_else(|| parent_node.children(&mut parent_node.walk()).find(|c| c.kind() == "throws"));
+                            if let Some(throws_node) = throws_node {
+                                let t_text = ast.node_text(&throws_node);
+                                if t_text.contains(exc_name) || t_text.contains("Exception") || t_text.contains("Throwable") {
+                                    in_try = true;
+                                }
+                            }
+                            break;
+                        }
+                        if parent_node.kind() == "lambda_expression" {
+                            break;
+                        }
+                        p = parent_node.parent();
+                    }
+
+                    if !in_try {
+                        let name_node = node.child_by_field_name("name").unwrap_or(node);
+                        out.push(SemanticDiagnostic {
+                            range: ast.node_range(&name_node),
+                            message: format!("Unhandled exception: {}; must be caught or declared to be thrown", exc_name),
+                            code: DiagnosticCode::UnhandledException,
+                        });
+                    }
+                }
+
+                // Check for static method accessed via instance (compiler.warn.static.access)
+                if let (Some(obj), Some(name_node)) = (node.child_by_field_name("object"), node.child_by_field_name("name")) {
+                    let m_name = ast.node_text(&name_node);
+                    let obj_text = ast.node_text(&obj);
+                    let static_owner = match m_name {
+                        "sleep" | "yield" | "currentThread" | "interrupted" | "holdsLock" => Some("Thread"),
+                        "currentTimeMillis" | "nanoTime" | "gc" | "exit" | "getenv" | "getProperty" | "lineSeparator" => Some("System"),
+                        "emptyList" | "emptyMap" | "emptySet" | "singletonList" | "unmodifiableList" => Some("Collections"),
+                        "min" | "max" | "abs" | "sqrt" | "pow" | "random" | "round" | "ceil" | "floor" => Some("Math"),
+                        "requireNonNull" | "checkIndex" => Some("Objects"),
+                        _ => None,
+                    };
+                    if let Some(owner) = static_owner {
+                        if obj_text != owner && !obj_text.ends_with(&format!(".{}", owner)) && obj_text != "super" && obj_text != "this" {
+                            out.push(SemanticDiagnostic {
+                                range: ast.node_range(&node),
+                                message: format!("The static method '{}' from the type '{}' should be accessed in a static way", m_name, owner),
+                                code: DiagnosticCode::StaticMemberViaInstance,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Check for string concatenation in loops (performance warning)
+            if node.kind() == "for_statement"
+                || node.kind() == "enhanced_for_statement"
+                || node.kind() == "while_statement"
+                || node.kind() == "do_statement"
+            {
+                fn check_loop_string_concat(n: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<SemanticDiagnostic>) {
+                    if n.kind() == "assignment_expression" {
+                        let text = ast.node_text(&n);
+                        if text.contains("+=") {
+                            out.push(SemanticDiagnostic {
+                                range: ast.node_range(&n),
+                                message: "String concatenation in loop: consider using 'StringBuilder' for better performance".to_string(),
+                                code: DiagnosticCode::StringConcatInLoop,
+                            });
+                        }
+                    }
+                    let mut cursor = n.walk();
+                    for child in n.children(&mut cursor) {
+                        check_loop_string_concat(child, ast, out);
+                    }
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    check_loop_string_concat(body, ast, out);
+                }
+            }
+
+            // Check for uninitialized blank final fields in class constructors
+            if node.kind() == "class_declaration" {
+                let mut blank_final_fields = Vec::new();
+                let mut constructors = Vec::new();
+
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    for member in body.children(&mut cursor) {
+                        if member.kind() == "field_declaration" {
+                            let is_final = member.children(&mut member.walk()).any(|c| {
+                                (c.kind() == "modifiers" && ast.node_text(&c).split_whitespace().any(|w| w == "final"))
+                                    || ast.node_text(&c) == "final"
+                            });
+                            let is_static = member.children(&mut member.walk()).any(|c| {
+                                (c.kind() == "modifiers" && ast.node_text(&c).split_whitespace().any(|w| w == "static"))
+                                    || ast.node_text(&c) == "static"
+                            });
+                            if is_final && !is_static {
+                                let mut f_cursor = member.walk();
+                                for dec in member.children(&mut f_cursor) {
+                                    if dec.kind() == "variable_declarator" && dec.child_by_field_name("value").is_none() {
+                                        if let Some(name_node) = dec.child_by_field_name("name") {
+                                            blank_final_fields.push((ast.node_text(&name_node).to_string(), ast.node_range(&name_node)));
+                                        }
+                                    }
+                                }
+                            }
+                        } else if member.kind() == "constructor_declaration" {
+                            constructors.push(member);
+                        }
+                    }
+                }
+
+                if !blank_final_fields.is_empty() && !constructors.is_empty() {
+                    for ctor in &constructors {
+                        let ctor_text = ast.node_text(ctor);
+                        if ctor_text.contains("this(") {
+                            continue;
+                        }
+                        for (fname, frange) in &blank_final_fields {
+                            let assigned = ctor_text.contains(&format!("this.{} =", fname))
+                                || ctor_text.contains(&format!("this.{}=", fname))
+                                || ctor_text.contains(&format!("{} =", fname))
+                                || ctor_text.contains(&format!("{}=", fname));
+                            if !assigned {
+                                out.push(SemanticDiagnostic {
+                                    range: frange.clone(),
+                                    message: format!("Variable '{}' might not have been initialized in constructor", fname),
+                                    code: DiagnosticCode::UninitializedVariable,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check for unused private fields and methods in class
+                let class_name = node.child_by_field_name("name").map(|n| ast.node_text(&n)).unwrap_or("");
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut private_fields = Vec::new();
+                    let mut private_methods = Vec::new();
+                    let mut methods_to_check_override = Vec::new();
+
+                    let mut iface_names = Vec::new();
+                    if let Some(interfaces_node) = node.child_by_field_name("interfaces") {
+                        let text = ast.node_text(&interfaces_node);
+                        iface_names.push(text);
+                    }
+                    for ch in node.children(&mut node.walk()) {
+                        if ch.kind() == "super_interfaces" {
+                            iface_names.push(ast.node_text(&ch));
+                        }
+                    }
+
+                    let mut cursor = body.walk();
+                    for member in body.children(&mut cursor) {
+                        if member.kind() == "field_declaration" {
+                            let is_private = member.children(&mut member.walk()).any(|c| {
+                                (c.kind() == "modifiers" && ast.node_text(&c).split_whitespace().any(|w| w == "private"))
+                                    || ast.node_text(&c) == "private"
+                            });
+                            let is_annotated = member.children(&mut member.walk()).any(|c| c.kind() == "marker_annotation" || c.kind() == "annotation");
+                            if is_private && !is_annotated {
+                                for dec in member.children(&mut member.walk()) {
+                                    if dec.kind() == "variable_declarator" {
+                                        if let Some(name_node) = dec.child_by_field_name("name") {
+                                            private_fields.push((ast.node_text(&name_node).to_string(), ast.node_range(&name_node)));
+                                        }
+                                    }
+                                }
+                            }
+                        } else if member.kind() == "method_declaration" {
+                            let is_private = member.children(&mut member.walk()).any(|c| {
+                                (c.kind() == "modifiers" && ast.node_text(&c).split_whitespace().any(|w| w == "private"))
+                                    || ast.node_text(&c) == "private"
+                            });
+                            let is_annotated = member.children(&mut member.walk()).any(|c| c.kind() == "marker_annotation" || c.kind() == "annotation");
+                            if is_private && !is_annotated {
+                                if let Some(name_node) = member.child_by_field_name("name") {
+                                    private_methods.push((ast.node_text(&name_node).to_string(), ast.node_range(&name_node)));
+                                }
+                            }
+
+                            // Check missing @Override
+                            let has_override = member.children(&mut member.walk()).any(|c| {
+                                (c.kind() == "marker_annotation" || c.kind() == "annotation") && ast.node_text(&c).contains("Override")
+                            });
+                            if !has_override {
+                                if let Some(m_name_node) = member.child_by_field_name("name") {
+                                    let m_name = ast.node_text(&m_name_node);
+                                    let p_count = member.child_by_field_name("parameters").map(|p| {
+                                        p.children(&mut p.walk()).filter(|c| c.kind() == "formal_parameter").count()
+                                    }).unwrap_or(0);
+                                    methods_to_check_override.push((m_name.to_string(), p_count, ast.node_range(&m_name_node)));
+                                }
+                            }
+                        }
+                    }
+
+                    if !private_fields.is_empty() || !private_methods.is_empty() {
+                        let mut all_idents = Vec::new();
+                        fn collect_body_idents(n: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<String>) {
+                            if n.kind() == "identifier" {
+                                out.push(ast.node_text(&n).to_string());
+                            }
+                            let mut c = n.walk();
+                            for child in n.children(&mut c) {
+                                collect_body_idents(child, ast, out);
+                            }
+                        }
+                        collect_body_idents(body, ast, &mut all_idents);
+
+                        let mut ident_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::with_capacity(all_idents.len());
+                        for id in &all_idents {
+                            *ident_counts.entry(id.as_str()).or_default() += 1;
+                        }
+
+                        for (fname, frange) in private_fields {
+                            let count = ident_counts.get(fname.as_str()).copied().unwrap_or(0);
+                            if count <= 1 {
+                                out.push(SemanticDiagnostic {
+                                    range: frange,
+                                    message: format!("The value of the field '{}.{}' is not used", class_name, fname),
+                                    code: DiagnosticCode::UnusedPrivateMember,
+                                });
+                            }
+                        }
+
+                        for (mname, mrange) in private_methods {
+                            let count = ident_counts.get(mname.as_str()).copied().unwrap_or(0);
+                            if count <= 1 {
+                                out.push(SemanticDiagnostic {
+                                    range: mrange,
+                                    message: format!("The method '{}' from the type '{}' is never used locally", mname, class_name),
+                                    code: DiagnosticCode::UnusedPrivateMember,
+                                });
+                            }
+                        }
+                    }
+
+                    // Check if methods match standard interfaces
+                    if !iface_names.is_empty() && !methods_to_check_override.is_empty() {
+                        let joined_ifaces = iface_names.join(" ");
+                        for (mname, pcount, mrange) in methods_to_check_override {
+                            let matched_iface = if joined_ifaces.contains("Runnable") && mname == "run" && pcount == 0 {
+                                Some("Runnable")
+                            } else if joined_ifaces.contains("Comparable") && mname == "compareTo" && pcount == 1 {
+                                Some("Comparable")
+                            } else if (joined_ifaces.contains("Closeable") || joined_ifaces.contains("AutoCloseable")) && mname == "close" && pcount == 0 {
+                                Some("AutoCloseable")
+                            } else if joined_ifaces.contains("Callable") && mname == "call" && pcount == 0 {
+                                Some("Callable")
+                            } else if joined_ifaces.contains("Supplier") && mname == "get" && pcount == 0 {
+                                Some("Supplier")
+                            } else if joined_ifaces.contains("Consumer") && mname == "accept" && pcount == 1 {
+                                Some("Consumer")
+                            } else {
+                                None
+                            };
+
+                            if let Some(iface) = matched_iface {
+                                out.push(SemanticDiagnostic {
+                                    range: mrange,
+                                    message: format!("Method '{}' overrides or implements a method in '{}', but is missing '@Override' annotation", mname, iface),
+                                    code: DiagnosticCode::MissingOverride,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -554,47 +1877,81 @@ impl JavaAst {
                             }
                         }
                     }
-                    if has_cases && !has_default && node.kind() == "switch_expression" {
-                        out.push((
-                            ast.node_range(&node),
-                            "Switch expression does not cover all possible input values and lacks a 'default' branch".to_string(),
-                        ));
+                    if has_cases && !has_default {
+                        let msg = if node.kind() == "switch_expression" {
+                            "Switch expression does not cover all possible input values and lacks a 'default' branch"
+                        } else {
+                            "Switch statement does not cover all possible values and lacks a 'default' branch"
+                        };
+                        out.push(SemanticDiagnostic {
+                            range: ast.node_range(&node),
+                            message: msg.to_string(),
+                            code: DiagnosticCode::SwitchMissingDefault,
+                        });
                     }
                 }
             }
 
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                traverse(child, ast, out);
+                traverse(child, ast, final_vars, out);
             }
         }
 
-        traverse(root, self, &mut diags);
+        traverse(root, self, &final_vars, &mut diags);
         diags
     }
 
     /// Find all occurrences of an identifier name in this AST
     pub fn find_all_occurrences(&self, ident: &str) -> Vec<Range> {
-        let mut occurrences = Vec::new();
+        if !self.source.contains(ident) {
+            return Vec::new();
+        }
+        let map = self.find_all_occurrences_multiple(&[ident]);
+        map.into_values().next().unwrap_or_default()
+    }
+
+    /// Find all occurrences of multiple identifier names in a single AST traversal pass
+    pub fn find_all_occurrences_multiple(&self, idents: &[&str]) -> std::collections::HashMap<String, Vec<Range>> {
+        let mut result: std::collections::HashMap<String, Vec<Range>> = std::collections::HashMap::new();
+        let target_set: std::collections::HashSet<&str> = idents
+            .iter()
+            .copied()
+            .filter(|id| self.source.contains(*id))
+            .collect();
+
+        if target_set.is_empty() {
+            return result;
+        }
+
         let root = self.tree.root_node();
 
-        fn traverse(node: tree_sitter::Node, ast: &JavaAst, ident: &str, out: &mut Vec<Range>) {
-            if (node.kind() == "identifier" || node.kind() == "type_identifier")
-                && ast.node_text(&node) == ident {
-                    out.push(ast.node_range(&node));
+        fn traverse(
+            node: tree_sitter::Node,
+            ast: &JavaAst,
+            target_set: &std::collections::HashSet<&str>,
+            out: &mut std::collections::HashMap<String, Vec<Range>>,
+        ) {
+            if node.kind() == "identifier" || node.kind() == "type_identifier" {
+                let text = ast.node_text(&node);
+                if target_set.contains(text) {
+                    out.entry(text.to_string())
+                        .or_default()
+                        .push(ast.node_range(&node));
                 }
+            }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                traverse(child, ast, ident, out);
+                traverse(child, ast, target_set, out);
             }
         }
 
-        traverse(root, self, ident, &mut occurrences);
-        occurrences
+        traverse(root, self, &target_set, &mut result);
+        result
     }
 
-    /// Locate method call context at cursor: returns (method_name, active_parameter_index)
-    pub fn find_method_call_at_position(&self, line: u32, character: u32) -> Option<(String, u32)> {
+    /// Locate method/constructor call context at cursor: returns (target_name, active_parameter_index, is_constructor)
+    pub fn find_method_call_at_position(&self, line: u32, character: u32) -> Option<(String, u32, bool)> {
         let root = self.tree.root_node();
         let point = tree_sitter::Point {
             row: line as usize,
@@ -602,12 +1959,13 @@ impl JavaAst {
         };
         let mut node = root.descendant_for_point_range(point, point)?;
 
-        // Walk up to find argument_list or method_invocation
-        while node.kind() != "method_invocation" && node.kind() != "argument_list" {
-            {
-                let parent = node.parent()?;
-                node = parent;
-            }
+        // Walk up to find argument_list, method_invocation, or object_creation_expression
+        while node.kind() != "method_invocation"
+            && node.kind() != "argument_list"
+            && node.kind() != "object_creation_expression"
+        {
+            let parent = node.parent()?;
+            node = parent;
         }
 
         let invocation_node = if node.kind() == "argument_list" {
@@ -616,17 +1974,22 @@ impl JavaAst {
             node
         };
 
-        if invocation_node.kind() != "method_invocation" {
+        let (target_name, is_constructor) = if invocation_node.kind() == "method_invocation" {
+            let name_node = invocation_node.child_by_field_name("name")?;
+            (self.node_text(&name_node).to_string(), false)
+        } else if invocation_node.kind() == "object_creation_expression" {
+            let type_node = invocation_node.child_by_field_name("type")?;
+            let raw_text = self.node_text(&type_node);
+            let clean = raw_text.split('<').next().unwrap_or(raw_text).trim();
+            let simple = clean.split('.').last().unwrap_or(clean);
+            (simple.to_string(), true)
+        } else {
             return None;
-        }
-
-        let name_node = invocation_node.child_by_field_name("name")?;
-        let method_name = self.node_text(&name_node).to_string();
+        };
 
         // Calculate active parameter index by counting commas before cursor
         let mut active_param = 0;
         if let Some(args_node) = invocation_node.child_by_field_name("arguments") {
-            let _cursor_byte = point.row; // approximate or count siblings
             let mut cursor = args_node.walk();
             for child in args_node.children(&mut cursor) {
                 if child.start_position().row > point.row
@@ -640,7 +2003,7 @@ impl JavaAst {
             }
         }
 
-        Some((method_name, active_param))
+        Some((target_name, active_param, is_constructor))
     }
 
     /// Extract code folding ranges (Imports block, Classes, Methods, Comments)
@@ -728,6 +2091,13 @@ impl JavaAst {
                     cls.simple_name, params_str, inits_str
                 );
                 generated.push((format!("Generate Constructor using fields for '{}'", cls.simple_name), constructor_code));
+            }
+
+            // Generate default no-arg constructor if not already present
+            let has_no_arg_ctor = cls.methods.iter().any(|m| m.name == cls.simple_name && m.parameters.is_empty());
+            if !has_no_arg_ctor {
+                let default_ctor = format!("    public {}() {{\n    }}\n", cls.simple_name);
+                generated.push((format!("Generate default constructor for '{}'", cls.simple_name), default_ctor));
             }
         }
         generated
@@ -883,7 +2253,7 @@ impl JavaAst {
         Some((title, self.node_range(&node), const_name, const_decl))
     }
 
-    /// Generate QuickFix to create method stub if invoking an unrecognised method
+    /// Generate QuickFix to create method stub if invoking an unrecognised method on current class
     pub fn generate_create_method_stub_quickfix(
         &self,
         line: u32,
@@ -899,6 +2269,16 @@ impl JavaAst {
             if n.kind() == "method_invocation" {
                 if let Some(name_n) = n.child_by_field_name("name") {
                     let m_name = self.node_text(&name_n);
+
+                    // If invocation has an explicit receiver object that is not 'this',
+                    // do not suggest creating method in enclosing class (e.g. b.bMethod() calls B, not enclosing A)
+                    if let Some(obj_n) = n.child_by_field_name("object") {
+                        let obj_text = self.node_text(&obj_n);
+                        if obj_text != "this" {
+                            return None;
+                        }
+                    }
+
                     let title = format!("Create method '{}()' in enclosing class", m_name);
                     let stub = format!(
                         "    private void {}() {{\n        // TODO: auto-generated method stub\n    }}\n",
@@ -1039,32 +2419,828 @@ impl JavaAst {
         Some((title, self.node_range(&params_n), updated_params))
     }
 
-    /// Extract Inlay Hints for method arguments & variable type hints in this AST: returns (Position, label)
+    /// Generate "Surround with try-catch" refactoring
+    pub fn generate_surround_with_try_catch(
+        &self,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let (s_line, e_line) = if start_line == end_line && start_col == end_col {
+            let point = tree_sitter::Point {
+                row: start_line as usize,
+                column: start_col as usize,
+            };
+            let mut node = root.descendant_for_point_range(point, point)?;
+            while !node.kind().ends_with("_statement") && node.kind() != "local_variable_declaration" {
+                if let Some(p) = node.parent() {
+                    if matches!(p.kind(), "class_body" | "compilation_unit") {
+                        return None;
+                    }
+                    node = p;
+                } else {
+                    return None;
+                }
+            }
+            let s = node.start_position().row as u32;
+            let e = node.end_position().row as u32;
+            (s, e)
+        } else {
+            let s = start_line.min(end_line);
+            let e = start_line.max(end_line);
+            (s, e)
+        };
+
+        let lines: Vec<&str> = self.source.lines().collect();
+        if s_line as usize >= lines.len() {
+            return None;
+        }
+        let e_line = e_line.min(lines.len().saturating_sub(1) as u32);
+
+        let first_line = lines[s_line as usize];
+        let base_indent = first_line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+        let body_indent = format!("{}    ", base_indent);
+
+        let mut wrapped = String::new();
+        wrapped.push_str(&format!("{}try {{\n", base_indent));
+        for i in s_line..=e_line {
+            let line = lines[i as usize];
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                wrapped.push('\n');
+            } else {
+                wrapped.push_str(&body_indent);
+                wrapped.push_str(trimmed);
+                wrapped.push('\n');
+            }
+        }
+        wrapped.push_str(&format!("{}}} catch (Exception e) {{\n", base_indent));
+        wrapped.push_str(&format!("{}    e.printStackTrace();\n", base_indent));
+        wrapped.push_str(&format!("{}}}\n", base_indent));
+
+        let has_next_line = (e_line as usize + 1) < lines.len();
+        let range = if has_next_line {
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: s_line, character: 0 },
+                end: tower_lsp::lsp_types::Position { line: e_line + 1, character: 0 },
+            }
+        } else {
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: s_line, character: 0 },
+                end: tower_lsp::lsp_types::Position { line: e_line, character: lines[e_line as usize].len() as u32 },
+            }
+        };
+
+        Some(("Surround with try-catch".to_string(), range, wrapped))
+    }
+
+    /// Generate "Add return statement" quickfix for methods with missing return
+    pub fn generate_missing_return_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut node = root.descendant_for_point_range(point, point)?;
+        while node.kind() != "method_declaration" {
+            node = node.parent()?;
+        }
+
+        let body = node.child_by_field_name("body")?;
+        let type_node = node.child_by_field_name("type")?;
+        let ret_type = self.node_text(&type_node).trim();
+        if ret_type == "void" {
+            return None;
+        }
+
+        let default_val = match ret_type {
+            "boolean" => "false",
+            "int" | "short" | "byte" | "char" => "0",
+            "long" => "0L",
+            "float" => "0.0f",
+            "double" => "0.0",
+            _ if ret_type.starts_with("Optional") => "Optional.empty()",
+            _ => "null",
+        };
+
+        let close_brace_row = body.end_position().row as u32;
+        let insertion_line = close_brace_row;
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: insertion_line, character: 0 },
+            end: tower_lsp::lsp_types::Position { line: insertion_line, character: 0 },
+        };
+
+        let lines: Vec<&str> = self.source.lines().collect();
+        let close_line = lines.get(close_brace_row as usize).unwrap_or(&"");
+        let close_indent = close_line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+        let return_stmt = format!("{}    return {};\n", close_indent, default_val);
+
+        let title = format!("Add 'return {};'", default_val);
+        Some((title, range, return_stmt))
+    }
+
+    /// Generate "Add 'throws ...' to method signature" quickfix
+    pub fn generate_add_throws_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut target_exception = None;
+        let mut anchor_node = root.descendant_for_point_range(point, point);
+
+        let mut curr = anchor_node;
+        while let Some(n) = curr {
+            if n.kind() == "throw_statement" {
+                if let Some(expr) = n.child_by_field_name("expression") {
+                    let text = self.node_text(&expr);
+                    if let Some(open_p) = text.find('(') {
+                        let name_part = text[..open_p].trim();
+                        let simple = name_part.split_whitespace().last().unwrap_or("Exception");
+                        let simple = simple.split('.').last().unwrap_or("Exception");
+                        target_exception = Some(simple.to_string());
+                    } else {
+                        let simple = text.split_whitespace().last().unwrap_or("Exception");
+                        target_exception = Some(simple.to_string());
+                    }
+                } else {
+                    target_exception = Some("Exception".to_string());
+                }
+                break;
+            } else if n.kind() == "method_invocation" {
+                let m_name = n.child_by_field_name("name").map(|name_n| self.node_text(&name_n)).unwrap_or("");
+                let exc = match m_name {
+                    "sleep" => Some("InterruptedException"),
+                    "read" | "readAllBytes" | "readAllLines" | "write" | "writeString" | "readLine" | "close" => Some("IOException"),
+                    "forName" => Some("ClassNotFoundException"),
+                    _ => None,
+                };
+                if let Some(e) = exc {
+                    target_exception = Some(e.to_string());
+                    break;
+                }
+            }
+            if matches!(n.kind(), "method_declaration" | "constructor_declaration" | "class_declaration") {
+                break;
+            }
+            curr = n.parent();
+        }
+
+        if target_exception.is_none() {
+            fn find_exc_on_line(n: tree_sitter::Node, ast: &JavaAst, target_line: u32) -> Option<(String, tree_sitter::Node<'static>)> {
+                if n.start_position().row as u32 <= target_line && n.end_position().row as u32 >= target_line {
+                    if n.kind() == "throw_statement" {
+                        let text = ast.node_text(&n);
+                        let name = if let Some(open_p) = text.find('(') {
+                            let prefix = &text[..open_p];
+                            let simple = prefix.split_whitespace().last().unwrap_or("Exception");
+                            simple.split('.').last().unwrap_or("Exception").to_string()
+                        } else {
+                            "Exception".to_string()
+                        };
+                        return Some((name, unsafe { std::mem::transmute(n) }));
+                    } else if n.kind() == "method_invocation" {
+                        let m_name = n.child_by_field_name("name").map(|name_n| ast.node_text(&name_n)).unwrap_or("");
+                        let exc = match m_name {
+                            "sleep" => Some("InterruptedException"),
+                            "read" | "readAllBytes" | "readAllLines" | "write" | "writeString" | "readLine" | "close" => Some("IOException"),
+                            "forName" => Some("ClassNotFoundException"),
+                            _ => None,
+                        };
+                        if let Some(e) = exc {
+                            return Some((e.to_string(), unsafe { std::mem::transmute(n) }));
+                        }
+                    }
+                    let mut cursor = n.walk();
+                    for ch in n.children(&mut cursor) {
+                        if let Some(res) = find_exc_on_line(ch, ast, target_line) {
+                            return Some(res);
+                        }
+                    }
+                }
+                None
+            }
+            if let Some((e, found_node)) = find_exc_on_line(root, self, line) {
+                target_exception = Some(e);
+                anchor_node = Some(found_node);
+            }
+        }
+
+        let exc_name = target_exception?;
+        let node = anchor_node?;
+
+        // Find enclosing method_declaration or constructor_declaration
+        let mut cur = Some(node);
+        let mut method_opt = None;
+        while let Some(n) = cur {
+            if n.kind() == "method_declaration" || n.kind() == "constructor_declaration" {
+                method_opt = Some(n);
+                break;
+            }
+            cur = n.parent();
+        }
+        let method_node = method_opt?;
+
+        let throws_n = method_node.child_by_field_name("throws")
+            .or_else(|| method_node.children(&mut method_node.walk()).find(|c| c.kind() == "throws"));
+        if let Some(throws_n) = throws_n {
+            let throws_text = self.node_text(&throws_n);
+            if throws_text.contains(&exc_name) || throws_text.contains("Exception") || throws_text.contains("Throwable") {
+                return None;
+            }
+            let end_p = throws_n.end_position();
+            let range = tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: end_p.row as u32, character: end_p.column as u32 },
+                end: tower_lsp::lsp_types::Position { line: end_p.row as u32, character: end_p.column as u32 },
+            };
+            let title = format!("Add 'throws {}' to method signature", exc_name);
+            Some((title, range, format!(", {}", exc_name)))
+        } else {
+            let params_n = method_node.child_by_field_name("parameters")?;
+            let end_p = params_n.end_position();
+            let range = tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: end_p.row as u32, character: end_p.column as u32 },
+                end: tower_lsp::lsp_types::Position { line: end_p.row as u32, character: end_p.column as u32 },
+            };
+            let title = format!("Add 'throws {}' to method signature", exc_name);
+            Some((title, range, format!(" throws {}", exc_name)))
+        }
+    }
+
+    /// Generate "Add 'default' branch to switch" quickfix
+    pub fn generate_switch_add_default_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut switch_opt = None;
+        let mut curr = node;
+        while let Some(n) = curr {
+            if n.kind() == "switch_expression" || n.kind() == "switch_statement" {
+                switch_opt = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        if switch_opt.is_none() {
+            fn find_switch_on_line(n: tree_sitter::Node, target_line: u32) -> Option<tree_sitter::Node<'static>> {
+                if n.start_position().row as u32 <= target_line && n.end_position().row as u32 >= target_line {
+                    if n.kind() == "switch_expression" || n.kind() == "switch_statement" {
+                        return Some(unsafe { std::mem::transmute(n) });
+                    }
+                    let mut cursor = n.walk();
+                    for ch in n.children(&mut cursor) {
+                        if let Some(res) = find_switch_on_line(ch, target_line) {
+                            return Some(res);
+                        }
+                    }
+                }
+                None
+            }
+            switch_opt = find_switch_on_line(root, line);
+        }
+
+        let switch_node = switch_opt?;
+        let body = switch_node.child_by_field_name("body")?;
+
+        let mut has_default = false;
+        let mut uses_arrow = false;
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            let text = self.node_text(&child);
+            if text.contains("default") {
+                has_default = true;
+                break;
+            }
+            if child.kind() == "switch_rule" || text.contains("->") {
+                uses_arrow = true;
+            }
+        }
+        if has_default {
+            return None;
+        }
+
+        let is_expr = switch_node.kind() == "switch_expression";
+        let lines: Vec<&str> = self.source.lines().collect();
+
+        let close_p = body.end_position();
+        let close_row = close_p.row;
+        let close_col = close_p.column.saturating_sub(1);
+        let switch_row = switch_node.start_position().row;
+
+        let switch_line = lines.get(switch_row).unwrap_or(&"");
+        let switch_indent = switch_line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+        let case_indent = format!("{}    ", switch_indent);
+
+        let (range, default_snippet) = if close_row == switch_row {
+            let branch = if uses_arrow {
+                " default -> throw new IllegalStateException(); "
+            } else {
+                " default: break; "
+            };
+            (
+                tower_lsp::lsp_types::Range {
+                    start: tower_lsp::lsp_types::Position { line: close_row as u32, character: close_col as u32 },
+                    end: tower_lsp::lsp_types::Position { line: close_row as u32, character: close_col as u32 },
+                },
+                branch.to_string(),
+            )
+        } else {
+            let snippet = if uses_arrow {
+                if is_expr {
+                    format!("{}default -> throw new IllegalStateException(\"Unexpected value\");\n", case_indent)
+                } else {
+                    format!("{}default -> {{}}\n", case_indent)
+                }
+            } else {
+                format!("{}default:\n{}    break;\n", case_indent, case_indent)
+            };
+            (
+                tower_lsp::lsp_types::Range {
+                    start: tower_lsp::lsp_types::Position { line: close_row as u32, character: 0 },
+                    end: tower_lsp::lsp_types::Position { line: close_row as u32, character: 0 },
+                },
+                snippet,
+            )
+        };
+
+        Some(("Add 'default' branch to switch".to_string(), range, default_snippet))
+    }
+
+    /// Generate "Initialize field" quickfix for blank final fields
+    pub fn generate_initialize_field_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut field_decl = None;
+        let mut curr = node;
+        while let Some(n) = curr {
+            if n.kind() == "field_declaration" {
+                field_decl = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        if field_decl.is_none() {
+            fn find_field_on_line(n: tree_sitter::Node, target_line: u32) -> Option<tree_sitter::Node<'static>> {
+                if n.start_position().row as u32 <= target_line && n.end_position().row as u32 >= target_line {
+                    if n.kind() == "field_declaration" {
+                        return Some(unsafe { std::mem::transmute(n) });
+                    }
+                    let mut cursor = n.walk();
+                    for ch in n.children(&mut cursor) {
+                        if let Some(res) = find_field_on_line(ch, target_line) {
+                            return Some(res);
+                        }
+                    }
+                }
+                None
+            }
+            field_decl = find_field_on_line(root, line);
+        }
+
+        let decl_node = field_decl?;
+        let is_final = decl_node.children(&mut decl_node.walk()).any(|c| {
+            (c.kind() == "modifiers" && self.node_text(&c).contains("final")) || self.node_text(&c) == "final"
+        });
+        if !is_final {
+            return None;
+        }
+
+        let type_node = decl_node.child_by_field_name("type")?;
+        let ftype = self.node_text(&type_node).trim();
+
+        let mut cursor = decl_node.walk();
+        for child in decl_node.children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if child.child_by_field_name("value").is_none() {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        let fname = self.node_text(&name_node);
+                        let default_val = match ftype {
+                            "int" | "short" | "byte" | "char" => "0",
+                            "long" => "0L",
+                            "float" => "0.0f",
+                            "double" => "0.0",
+                            "boolean" => "false",
+                            "String" => "\"\"",
+                            _ => "null",
+                        };
+                        let end_p = name_node.end_position();
+                        let range = tower_lsp::lsp_types::Range {
+                            start: tower_lsp::lsp_types::Position { line: end_p.row as u32, character: end_p.column as u32 },
+                            end: tower_lsp::lsp_types::Position { line: end_p.row as u32, character: end_p.column as u32 },
+                        };
+                        let title = format!("Initialize field '{}'", fname);
+                        return Some((title, range, format!(" = {}", default_val)));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Generate "Invert equals to 'literal'.equals(var)" refactoring to prevent NPE
+    pub fn generate_invert_equals_refactoring(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut method_inv = None;
+        while let Some(n) = curr {
+            if n.kind() == "method_invocation" {
+                method_inv = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let inv_node = method_inv?;
+        let m_name = inv_node.child_by_field_name("name").map(|n| self.node_text(&n))?;
+        if m_name != "equals" && m_name != "equalsIgnoreCase" {
+            return None;
+        }
+
+        let obj_node = inv_node.child_by_field_name("object")?;
+        let args_node = inv_node.child_by_field_name("arguments")?;
+
+        let mut cursor = args_node.walk();
+        let arg_expr = args_node.children(&mut cursor).find(|c| c.kind() != "(" && c.kind() != ")" && c.kind() != "," && c.is_named())?;
+
+        let obj_text = self.node_text(&obj_node).trim();
+        let arg_text = self.node_text(&arg_expr).trim();
+
+        let is_arg_literal = arg_expr.kind() == "string_literal";
+        let is_obj_literal = obj_node.kind() == "string_literal";
+
+        if is_arg_literal || is_obj_literal {
+            let inverted = format!("{}.{}({})", arg_text, m_name, obj_text);
+            let title = format!("Invert equals to {}.{}({})", arg_text, m_name, obj_text);
+            Some((title, self.node_lsp_range(&inv_node), inverted))
+        } else {
+            None
+        }
+    }
+
+    /// Generate "Convert anonymous class to lambda expression" refactoring
+    pub fn generate_convert_anonymous_to_lambda(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut obj_creation = None;
+        while let Some(n) = curr {
+            if n.kind() == "object_creation_expression" {
+                obj_creation = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let creation_node = obj_creation?;
+        let mut class_body = None;
+        let mut cursor = creation_node.walk();
+        for child in creation_node.children(&mut cursor) {
+            if child.kind() == "class_body" {
+                class_body = Some(child);
+                break;
+            }
+        }
+
+        let body = class_body?;
+        let mut methods = Vec::new();
+        let mut c = body.walk();
+        for child in body.children(&mut c) {
+            if child.kind() == "method_declaration" {
+                methods.push(child);
+            }
+        }
+
+        if methods.len() != 1 {
+            return None;
+        }
+
+        let method = methods[0];
+        let params_node = method.child_by_field_name("parameters")?;
+        let body_node = method.child_by_field_name("body")?;
+
+        let mut param_names = Vec::new();
+        let mut p_cursor = params_node.walk();
+        for p in params_node.children(&mut p_cursor) {
+            if p.kind() == "formal_parameter" {
+                if let Some(pname) = p.child_by_field_name("name") {
+                    param_names.push(self.node_text(&pname).to_string());
+                }
+            }
+        }
+
+        let params_text = if param_names.is_empty() {
+            "()".to_string()
+        } else if param_names.len() == 1 {
+            param_names[0].clone()
+        } else {
+            format!("({})", param_names.join(", "))
+        };
+
+        let body_text = self.node_text(&body_node);
+        let lambda_text = format!("{} -> {}", params_text, body_text);
+        let title = "Convert anonymous class to lambda expression".to_string();
+        Some((title, self.node_lsp_range(&creation_node), lambda_text))
+    }
+
+    /// Generate "Add '@Override' annotation" quickfix
+    pub fn generate_add_override_annotation_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut method_opt = None;
+        while let Some(n) = curr {
+            if n.kind() == "method_declaration" {
+                method_opt = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let method_node = method_opt?;
+        let has_override = method_node.children(&mut method_node.walk()).any(|c| {
+            (c.kind() == "marker_annotation" || c.kind() == "annotation") && self.node_text(&c).contains("Override")
+        });
+        if has_override {
+            return None;
+        }
+
+        let s_pos = method_node.start_position();
+        let lines: Vec<&str> = self.source.lines().collect();
+        let line_text = lines.get(s_pos.row).unwrap_or(&"");
+        let indent = line_text.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: s_pos.row as u32, character: s_pos.column as u32 },
+            end: tower_lsp::lsp_types::Position { line: s_pos.row as u32, character: s_pos.column as u32 },
+        };
+
+        let new_text = format!("@Override\n{}", indent);
+        Some(("Add '@Override' annotation".to_string(), range, new_text))
+    }
+
+    /// Generate QuickFix to change instance method/field access to static type access
+    pub fn generate_static_access_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+        let mut method_opt = None;
+        let mut curr = node;
+        while let Some(n) = curr {
+            if n.kind() == "method_invocation" {
+                method_opt = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let m_node = method_opt?;
+        let obj_node = m_node.child_by_field_name("object")?;
+        let name_node = m_node.child_by_field_name("name")?;
+        let m_name = self.node_text(&name_node);
+        let static_owner = match m_name {
+            "sleep" | "yield" | "currentThread" | "interrupted" | "holdsLock" => Some("Thread"),
+            "currentTimeMillis" | "nanoTime" | "gc" | "exit" | "getenv" | "getProperty" | "lineSeparator" => Some("System"),
+            "emptyList" | "emptyMap" | "emptySet" | "singletonList" | "unmodifiableList" => Some("Collections"),
+            "min" | "max" | "abs" | "sqrt" | "pow" | "random" | "round" | "ceil" | "floor" => Some("Math"),
+            "requireNonNull" | "checkIndex" => Some("Objects"),
+            _ => None,
+        }?;
+
+        let range = self.node_lsp_range(&obj_node);
+        let title = format!("Change access to static '{}.{}'", static_owner, m_name);
+        Some((title, range, static_owner.to_string()))
+    }
+
+    /// Generate QuickFix to remove unused parameter from method declaration
+    pub fn generate_remove_unused_parameter_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut formal_param = None;
+        while let Some(n) = curr {
+            if n.kind() == "formal_parameter" {
+                formal_param = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        if formal_param.is_none() {
+            let mut best = None;
+            fn search_params<'a>(n: tree_sitter::Node<'a>, l: u32, c: u32, best: &mut Option<tree_sitter::Node<'a>>) {
+                if n.start_position().row as u32 == l {
+                    if n.kind() == "formal_parameter" {
+                        if (n.start_position().column as u32) <= c && c <= (n.end_position().column as u32 + 2) {
+                            *best = Some(n);
+                            return;
+                        } else if best.is_none() {
+                            *best = Some(n);
+                        }
+                    }
+                    let mut cursor = n.walk();
+                    for ch in n.children(&mut cursor) {
+                        search_params(ch, l, c, best);
+                    }
+                } else if n.start_position().row as u32 <= l && n.end_position().row as u32 >= l {
+                    let mut cursor = n.walk();
+                    for ch in n.children(&mut cursor) {
+                        search_params(ch, l, c, best);
+                    }
+                }
+            }
+            search_params(root, line, col, &mut best);
+            formal_param = best;
+        }
+
+        let param_node = formal_param?;
+        let params_parent = param_node.parent()?;
+        let p_name = param_node.child_by_field_name("name").map(|n| self.node_text(&n))?;
+
+        let mut cursor = params_parent.walk();
+        let all_params: Vec<_> = params_parent.children(&mut cursor).filter(|c| c.kind() == "formal_parameter").collect();
+        let param_idx = all_params.iter().position(|p| p.id() == param_node.id())?;
+
+        let range = if all_params.len() == 1 {
+            self.node_lsp_range(&param_node)
+        } else if param_idx < all_params.len() - 1 {
+            let next_param = all_params[param_idx + 1];
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position {
+                    line: param_node.start_position().row as u32,
+                    character: param_node.start_position().column as u32,
+                },
+                end: tower_lsp::lsp_types::Position {
+                    line: next_param.start_position().row as u32,
+                    character: next_param.start_position().column as u32,
+                },
+            }
+        } else {
+            let prev_param = all_params[param_idx - 1];
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position {
+                    line: prev_param.end_position().row as u32,
+                    character: prev_param.end_position().column as u32,
+                },
+                end: tower_lsp::lsp_types::Position {
+                    line: param_node.end_position().row as u32,
+                    character: param_node.end_position().column as u32,
+                },
+            }
+        };
+
+        let title = format!("Remove unused parameter '{}'", p_name);
+        Some((title, range, String::new()))
+    }
+
+    /// Generate "Convert to try-with-resources" refactoring
+    pub fn generate_convert_to_try_with_resources(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut try_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "try_statement" {
+                try_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let try_stmt = try_node?;
+        let parent = try_stmt.parent()?;
+        let mut cursor = parent.walk();
+        let siblings: Vec<_> = parent.children(&mut cursor).collect();
+        let try_idx = siblings.iter().position(|s| s.id() == try_stmt.id())?;
+        if try_idx == 0 {
+            return None;
+        }
+
+        let prev_sibling = siblings[try_idx - 1];
+        if prev_sibling.kind() != "local_variable_declaration" {
+            return None;
+        }
+
+        let prev_text = self.node_text(&prev_sibling).trim().trim_end_matches(';').trim();
+        let is_autocloseable = prev_text.contains("Stream")
+            || prev_text.contains("Reader")
+            || prev_text.contains("Writer")
+            || prev_text.contains("Connection")
+            || prev_text.contains("Scanner");
+
+        if !is_autocloseable {
+            return None;
+        }
+
+        let body = try_stmt.child_by_field_name("body")?;
+        let body_text = self.node_text(&body);
+
+        let lines: Vec<&str> = self.source.lines().collect();
+        let s_row = prev_sibling.start_position().row;
+        let prev_line = lines.get(s_row).unwrap_or(&"");
+        let indent = prev_line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+
+        let new_code = format!("{}try ({}) {}", indent, prev_text, body_text);
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: prev_sibling.start_position().row as u32, character: 0 },
+            end: tower_lsp::lsp_types::Position {
+                line: try_stmt.end_position().row as u32,
+                character: try_stmt.end_position().column as u32,
+            },
+        };
+
+        Some(("Convert to try-with-resources".to_string(), range, new_code))
+    }
+
+    /// Extract Inlay Hints for variable type hints in this AST (e.g. Java 10+ var x = ...): returns (Position, label)
     pub fn find_inlay_hints(&self) -> Vec<(Position, String)> {
         let mut hints = Vec::new();
         let root = self.tree.root_node();
 
         fn traverse(node: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<(Position, String)>) {
-            // 1. Argument name hints
-            if node.kind() == "method_invocation" {
-                if let Some(args_node) = node.child_by_field_name("arguments") {
-                    let mut arg_idx = 0;
-                    let mut cursor = args_node.walk();
-                    for child in args_node.children(&mut cursor) {
-                        if child.kind() != "(" && child.kind() != ")" && child.kind() != "," {
-                            let start = child.start_position();
-                            let pos = Position {
-                                line: start.row as u32,
-                                character: start.column as u32,
-                            };
-                            out.push((pos, format!("arg{}: ", arg_idx)));
-                            arg_idx += 1;
-                        }
-                    }
-                }
-            }
-
-            // 2. Type hints for Java 10+ 'var' declarations: e.g. var x = new ArrayList<>(); -> x: ArrayList
+            // Type hints for Java 10+ 'var' declarations: e.g. var x = new ArrayList<>(); -> x: ArrayList
             if node.kind() == "local_variable_declaration" {
                 if let Some(type_n) = node.child_by_field_name("type") {
                     if ast.node_text(&type_n) == "var" {
@@ -1088,7 +3264,7 @@ impl JavaAst {
                                     let end = name_n.end_position();
                                     let pos = Position {
                                         line: end.row as u32,
-                                        character: end.column as u32,
+                                        character: ast.byte_col_to_utf16(end.row as u32, end.column),
                                     };
                                     out.push((pos, format!(": {}", inferred)));
                                 }
@@ -1106,6 +3282,59 @@ impl JavaAst {
 
         traverse(root, self, &mut hints);
         hints
+    }
+
+    /// Find method invocations and the positions of their arguments to resolve real parameter inlay hints
+    pub fn find_method_invocation_arg_positions(&self) -> Vec<InvocationArgInfo> {
+        let mut results = Vec::new();
+        let root = self.tree.root_node();
+
+        fn traverse(node: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<InvocationArgInfo>) {
+            if node.kind() == "method_invocation" {
+                if let (Some(name_n), Some(args_node)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("arguments"),
+                ) {
+                    let m_name = ast.node_text(&name_n).to_string();
+                    let recv_raw = node.child_by_field_name("object").map(|obj| ast.node_text(&obj).to_string());
+                    let mut steps = Vec::new();
+                    if let Some(obj) = node.child_by_field_name("object") {
+                        JavaAst::collect_receiver_steps(obj, ast, &mut steps);
+                    }
+                    let mut arg_nodes = Vec::new();
+                    let mut cursor = args_node.walk();
+                    for child in args_node.children(&mut cursor) {
+                        if child.is_named() {
+                            arg_nodes.push(child);
+                        }
+                    }
+                    let total = arg_nodes.len();
+                    for (idx, child) in arg_nodes.into_iter().enumerate() {
+                        let start = child.start_position();
+                        let pos = Position {
+                            line: start.row as u32,
+                            character: ast.byte_col_to_utf16(start.row as u32, start.column),
+                        };
+                        out.push(InvocationArgInfo {
+                            receiver_steps: steps.clone(),
+                            receiver_raw: recv_raw.clone(),
+                            method_name: m_name.clone(),
+                            arg_index: idx,
+                            total_args: total,
+                            position: pos,
+                        });
+                    }
+                }
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                traverse(child, ast, out);
+            }
+        }
+
+        traverse(root, self, &mut results);
+        results
     }
 
     /// Locate method declaration node at line/character
@@ -1156,19 +3385,16 @@ impl JavaAst {
             curr = n.parent();
         }
 
-        let method_node = match enclosing_method {
-            Some(m) => m,
-            None => return vars,
-        };
-
-        // 1. Extract formal parameters
-        if let Some(params_node) = method_node.child_by_field_name("parameters") {
-            let mut p_cursor = params_node.walk();
-            for p_child in params_node.children(&mut p_cursor) {
-                if p_child.kind() == "formal_parameter" || p_child.kind() == "spread_parameter" {
-                    let p_type = p_child.child_by_field_name("type").map(|t| self.node_text(&t)).unwrap_or("Object");
-                    if let Some(name_n) = p_child.child_by_field_name("name") {
-                        vars.push((self.node_text(&name_n).to_string(), p_type.to_string()));
+        if let Some(method_node) = enclosing_method {
+            // 1. Extract formal parameters
+            if let Some(params_node) = method_node.child_by_field_name("parameters") {
+                let mut p_cursor = params_node.walk();
+                for p_child in params_node.children(&mut p_cursor) {
+                    if p_child.kind() == "formal_parameter" || p_child.kind() == "spread_parameter" {
+                        let p_type = p_child.child_by_field_name("type").map(|t| self.node_text(&t)).unwrap_or("Object");
+                        if let Some(name_n) = p_child.child_by_field_name("name") {
+                            vars.push((self.node_text(&name_n).to_string(), p_type.to_string()));
+                        }
                     }
                 }
             }
@@ -1212,6 +3438,46 @@ impl JavaAst {
                         }
                     }
                 }
+            } else if node.kind() == "instanceof_expression" {
+                // Java 21 Record Pattern: instanceof Point(int x, int y)
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "record_pattern" {
+                        let mut r_cursor = child.walk();
+                        for r_child in child.children(&mut r_cursor) {
+                            if r_child.kind() == "record_pattern_body" {
+                                let mut b_cursor = r_child.walk();
+                                for b_child in r_child.children(&mut b_cursor) {
+                                    if b_child.kind() == "record_pattern_component" {
+                                        let c_type = b_child.child_by_field_name("type")
+                                            .map(|t| ast.node_text(&t).to_string())
+                                            .unwrap_or_else(|| {
+                                                b_child.children(&mut b_child.walk())
+                                                    .find(|c| c.kind().ends_with("_type") || c.kind() == "type_identifier")
+                                                    .map(|t| ast.node_text(&t).to_string())
+                                                    .unwrap_or_else(|| "Object".to_string())
+                                            });
+                                        if let Some(id_n) = b_child.child_by_field_name("name")
+                                            .or_else(|| b_child.children(&mut b_child.walk()).find(|c| c.kind() == "identifier")) {
+                                            out.push((ast.node_text(&id_n).to_string(), c_type));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Java 16 Type Pattern: instanceof String s
+                let children: Vec<_> = node.children(&mut node.walk()).collect();
+                if children.len() >= 4 {
+                    let maybe_type = &children[2];
+                    let maybe_name = &children[3];
+                    if (maybe_type.kind() == "type_identifier" || maybe_type.kind().ends_with("_type"))
+                        && maybe_name.kind() == "identifier" {
+                        out.push((ast.node_text(maybe_name).to_string(), ast.node_text(maybe_type).to_string()));
+                    }
+                }
             }
 
             let mut cursor = node.walk();
@@ -1220,8 +3486,59 @@ impl JavaAst {
             }
         }
 
-        if let Some(body_node) = method_node.child_by_field_name("body") {
-            collect_locals(body_node, self, point, &mut vars);
+        if let Some(m_node) = enclosing_method {
+            if let Some(body_node) = m_node.child_by_field_name("body") {
+                collect_locals(body_node, self, point, &mut vars);
+            }
+        }
+
+        // Fault-tolerant fallback 1: search preceding AST nodes for formal_parameters if vars is empty
+        if vars.is_empty() {
+            fn find_nearest_params(node: tree_sitter::Node, target_row: usize, ast: &JavaAst, out: &mut Vec<(String, String)>) {
+                if node.kind() == "formal_parameters" && node.start_position().row <= target_row {
+                    let mut p_cursor = node.walk();
+                    for p_child in node.children(&mut p_cursor) {
+                        if p_child.kind() == "formal_parameter" || p_child.kind() == "spread_parameter" {
+                            let p_type = p_child.child_by_field_name("type").map(|t| ast.node_text(&t)).unwrap_or("Object");
+                            if let Some(name_n) = p_child.child_by_field_name("name") {
+                                out.push((ast.node_text(&name_n).to_string(), p_type.to_string()));
+                            }
+                        }
+                    }
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.start_position().row <= target_row {
+                        find_nearest_params(child, target_row, ast, out);
+                    }
+                }
+            }
+            find_nearest_params(root, line as usize, self, &mut vars);
+        }
+
+        // Fault-tolerant fallback 2: text-based backward parameter scan if still empty
+        if vars.is_empty() {
+            for l in self.source.lines().take(line as usize + 1).collect::<Vec<_>>().into_iter().rev() {
+                let trimmed = l.trim();
+                if let (Some(open), Some(close)) = (trimmed.find('('), trimmed.find(')')) {
+                    if open < close {
+                        let inside = &trimmed[open + 1..close];
+                        for param in inside.split(',') {
+                            let parts: Vec<&str> = param.split_whitespace().collect();
+                            if parts.len() >= 2 {
+                                let p_type = parts[parts.len() - 2];
+                                let p_name = parts[parts.len() - 1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                                if !p_name.is_empty() && !p_type.is_empty() {
+                                    vars.push((p_name.to_string(), p_type.to_string()));
+                                }
+                            }
+                        }
+                        if !vars.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         vars
@@ -1257,6 +3574,134 @@ impl JavaAst {
 
         traverse(root, self, caller_method_name, false, &mut calls);
         calls
+    }
+
+    /// Check if identifier at position is a local variable, parameter, or catch parameter,
+    /// and if so, return all occurrences of that variable strictly within its enclosing scope (method or lambda).
+    pub fn find_local_scope_occurrences(&self, line: u32, character: u32) -> Option<(String, Vec<tower_lsp::lsp_types::Range>)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: character as usize,
+        };
+        let target_node = root.descendant_for_point_range(point, point)?;
+
+        let ident_node = if target_node.kind() == "identifier" {
+            target_node
+        } else if let Some(id) = target_node.child_by_field_name("name") {
+            id
+        } else {
+            return None;
+        };
+
+        let var_name = self.node_text(&ident_node);
+
+        // Find enclosing scope: method_declaration, constructor_declaration, or lambda_expression
+        let mut curr = Some(ident_node);
+        let mut enclosing_scope = None;
+        let mut is_local = false;
+
+        while let Some(n) = curr {
+            let k = n.kind();
+            if k == "variable_declarator" {
+                if let Some(p) = n.parent() {
+                    if p.kind() == "local_variable_declaration" {
+                        is_local = true;
+                    }
+                }
+            } else if matches!(k, "formal_parameter" | "spread_parameter" | "catch_formal_parameter" | "enhanced_for_statement" | "record_pattern_component") {
+                is_local = true;
+            } else if k == "identifier" && n.parent().map(|p| p.kind() == "instanceof_expression").unwrap_or(false) {
+                is_local = true;
+            }
+
+            if matches!(k, "method_declaration" | "constructor_declaration" | "lambda_expression") {
+                enclosing_scope = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let scope_node = enclosing_scope?;
+
+        if !is_local {
+            fn is_declared_in_scope(n: tree_sitter::Node, ast: &JavaAst, target_name: &str) -> bool {
+                let k = n.kind();
+                if k == "variable_declarator" {
+                    if let Some(name_n) = n.child_by_field_name("name") {
+                        if ast.node_text(&name_n) == target_name {
+                            if let Some(p) = n.parent() {
+                                if p.kind() == "local_variable_declaration" {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                } else if matches!(k, "formal_parameter" | "spread_parameter" | "catch_formal_parameter") {
+                    if let Some(name_n) = n.child_by_field_name("name") {
+                        if ast.node_text(&name_n) == target_name {
+                            return true;
+                        }
+                    }
+                } else if k == "enhanced_for_statement" {
+                    if let Some(name_n) = n.child_by_field_name("name") {
+                        if ast.node_text(&name_n) == target_name {
+                            return true;
+                        }
+                    }
+                } else if k == "record_pattern_component" {
+                    if let Some(name_n) = n.child_by_field_name("name")
+                        .or_else(|| n.children(&mut n.walk()).find(|c| c.kind() == "identifier")) {
+                        if ast.node_text(&name_n) == target_name {
+                            return true;
+                        }
+                    }
+                } else if k == "instanceof_expression" {
+                    let children: Vec<_> = n.children(&mut n.walk()).collect();
+                    if children.len() >= 4 {
+                        if let Some(last_child) = children.last() {
+                            if last_child.kind() == "identifier" && ast.node_text(last_child) == target_name {
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                let mut cursor = n.walk();
+                for child in n.children(&mut cursor) {
+                    if !matches!(child.kind(), "class_declaration" | "interface_declaration" | "record_declaration" | "enum_declaration") {
+                        if is_declared_in_scope(child, ast, target_name) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+
+            if !is_declared_in_scope(scope_node, self, var_name) {
+                return None;
+            }
+        }
+
+        let mut occs = Vec::new();
+        fn collect_ident_occurrences(n: tree_sitter::Node, ast: &JavaAst, target_name: &str, out: &mut Vec<tower_lsp::lsp_types::Range>) {
+            if n.kind() == "identifier" && ast.node_text(&n) == target_name {
+                out.push(ast.node_lsp_range(&n));
+            }
+            let mut cursor = n.walk();
+            for child in n.children(&mut cursor) {
+                if !matches!(child.kind(), "class_declaration" | "interface_declaration" | "record_declaration" | "enum_declaration") {
+                    collect_ident_occurrences(child, ast, target_name, out);
+                }
+            }
+        }
+
+        collect_ident_occurrences(scope_node, self, var_name, &mut occs);
+        if occs.is_empty() {
+            None
+        } else {
+            Some((var_name.to_string(), occs))
+        }
     }
 
     /// Extract semantic tokens: returns relative tokens (delta_line, delta_start, length, token_type, token_modifiers)
@@ -1410,6 +3855,135 @@ impl JavaAst {
         results
     }
 
+    /// Find test classes (classes with test methods or annotated with @SpringBootTest / @TestInstance)
+    pub fn find_test_classes(&self) -> Vec<(String, Range)> {
+        let mut results = Vec::new();
+        let root = self.tree.root_node();
+
+        fn traverse(node: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<(String, Range)>) {
+            if node.kind() == "class_declaration" {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let c_name = ast.node_text(&name_node);
+                    let c_text = ast.node_text(&node);
+
+                    let has_test_annotation = c_text.contains("@SpringBootTest")
+                        || c_text.contains("@TestInstance")
+                        || c_text.contains("@Nested");
+                    let name_ends_test = c_name.ends_with("Test")
+                        || c_name.ends_with("Tests")
+                        || c_name.ends_with("TestCase")
+                        || c_name.ends_with("IT");
+                    let contains_test_method = c_text.contains("@Test")
+                        || c_text.contains("@ParameterizedTest")
+                        || c_text.contains("@RepeatedTest");
+
+                    if has_test_annotation || (name_ends_test && contains_test_method) || contains_test_method {
+                        out.push((c_name.to_string(), ast.node_range(&name_node)));
+                    }
+                }
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                traverse(child, ast, out);
+            }
+        }
+
+        traverse(root, self, &mut results);
+        results
+    }
+
+    /// Extract Spring HTTP route endpoints (e.g. ("GET", "/api/users", range))
+    pub fn find_spring_endpoints(&self) -> Vec<(String, String, Range)> {
+        let mut results = Vec::new();
+        let root = self.tree.root_node();
+
+        fn extract_annotation_path(text: &str) -> String {
+            if let Some(start) = text.find('"') {
+                if let Some(end) = text[start + 1..].find('"') {
+                    return text[start + 1..start + 1 + end].to_string();
+                }
+            }
+            String::new()
+        }
+
+        fn combine_paths(base: &str, path: &str) -> String {
+            let clean_base = base.trim().trim_matches('"');
+            let clean_path = path.trim().trim_matches('"');
+            let b = clean_base.trim_end_matches('/');
+            let p = if clean_path.starts_with('/') {
+                clean_path.to_string()
+            } else if !clean_path.is_empty() {
+                format!("/{}", clean_path)
+            } else {
+                String::new()
+            };
+            let mut combined = format!("{}{}", b, p);
+            if combined.is_empty() {
+                combined = "/".to_string();
+            }
+            if !combined.starts_with('/') {
+                combined = format!("/{}", combined);
+            }
+            combined
+        }
+
+        fn traverse(node: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<(String, String, Range)>) {
+            if node.kind() == "class_declaration" {
+                let mut class_base_path = String::new();
+                let class_text = ast.node_text(&node);
+                if let Some(rm_idx) = class_text.find("@RequestMapping") {
+                    let rm_sub = &class_text[rm_idx..];
+                    class_base_path = extract_annotation_path(rm_sub.lines().next().unwrap_or(""));
+                }
+
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    for child in body.children(&mut cursor) {
+                        if child.kind() == "method_declaration" {
+                            if let Some(name_node) = child.child_by_field_name("name") {
+                                let m_text = ast.node_text(&child);
+                                let mut endpoint_info: Option<(&str, String)> = None;
+
+                                let mapping_specs = [
+                                    ("@GetMapping", "GET"),
+                                    ("@PostMapping", "POST"),
+                                    ("@PutMapping", "PUT"),
+                                    ("@DeleteMapping", "DELETE"),
+                                    ("@PatchMapping", "PATCH"),
+                                    ("@RequestMapping", "REQUEST"),
+                                ];
+
+                                for (annot, method) in mapping_specs {
+                                    if let Some(idx) = m_text.find(annot) {
+                                        let annot_sub = &m_text[idx..];
+                                        let line = annot_sub.lines().next().unwrap_or("");
+                                        let m_path = extract_annotation_path(line);
+                                        let full_path = combine_paths(&class_base_path, &m_path);
+                                        endpoint_info = Some((method, full_path));
+                                        break;
+                                    }
+                                }
+
+                                if let Some((http_m, path)) = endpoint_info {
+                                    out.push((http_m.to_string(), path, ast.node_range(&name_node)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                traverse(child, ast, out);
+            }
+        }
+
+        traverse(root, self, &mut results);
+        results
+    }
+
     /// Find the simple name of the enclosing class at a given position
     pub fn find_enclosing_class_at_position(&self, line: u32, character: u32) -> Option<String> {
         let root = self.tree.root_node();
@@ -1433,29 +4007,665 @@ impl JavaAst {
             }
             curr = n.parent();
         }
+
+        // Fault-tolerant text fallback: scan backwards for class/interface/enum/record declaration
+        for l in self.source.lines().take(line as usize + 1).collect::<Vec<_>>().into_iter().rev() {
+            let trimmed = l.trim();
+            for kw in &["class ", "interface ", "enum ", "record "] {
+                if let Some(idx) = trimmed.find(kw) {
+                    let after = &trimmed[idx + kw.len()..];
+                    let name = after
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+
         None
+    }
+
+    /// Extract declaration line of a member (method or field) in this AST, with method overload resolution
+    pub fn find_member_declaration_line(&self, member_name: &str, is_method: bool, arg_count: Option<usize>) -> Option<u32> {
+        let root = self.tree.root_node();
+        let mut fallback_line = None;
+
+        fn search_node(node: Node, ast: &JavaAst, member_name: &str, is_method: bool, arg_count: Option<usize>, fallback: &mut Option<u32>) -> Option<u32> {
+            if matches!(node.kind(), "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut b_cursor = body.walk();
+                    for member in body.children(&mut b_cursor) {
+                        if is_method && member.kind() == "method_declaration" {
+                            if let Some(name_node) = member.child_by_field_name("name") {
+                                if ast.node_text(&name_node) == member_name {
+                                    if fallback.is_none() {
+                                        *fallback = Some(name_node.start_position().row as u32);
+                                    }
+                                    if let Some(target_args) = arg_count {
+                                        let param_count = member.child_by_field_name("parameters").map(|p_node| {
+                                            let mut p_cursor = p_node.walk();
+                                            p_node.children(&mut p_cursor)
+                                                .filter(|c| c.kind() == "formal_parameter" || c.kind() == "spread_parameter")
+                                                .count()
+                                        }).unwrap_or(0);
+                                        if param_count == target_args {
+                                            return Some(name_node.start_position().row as u32);
+                                        }
+                                    } else {
+                                        return Some(name_node.start_position().row as u32);
+                                    }
+                                }
+                            }
+                        } else if !is_method && member.kind() == "field_declaration" {
+                            let mut f_cursor = member.walk();
+                            for dec in member.children(&mut f_cursor) {
+                                if dec.kind() == "variable_declarator" {
+                                    if let Some(name_node) = dec.child_by_field_name("name") {
+                                        if ast.node_text(&name_node) == member_name {
+                                            return Some(name_node.start_position().row as u32);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if matches!(member.kind(), "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") {
+                            if let Some(l) = search_node(member, ast, member_name, is_method, arg_count, fallback) {
+                                return Some(l);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if let Some(l) = search_node(child, ast, member_name, is_method, arg_count, fallback) {
+                        return Some(l);
+                    }
+                }
+            }
+            None
+        }
+
+        if let Some(l) = search_node(root, self, member_name, is_method, arg_count, &mut fallback_line) {
+            Some(l)
+        } else {
+            fallback_line
+        }
+    }
+
+    pub(crate) fn collect_receiver_steps(node: Node, ast: &JavaAst, steps: &mut Vec<ReceiverStep>) {
+        match node.kind() {
+            "method_invocation" => {
+                if let Some(inner_obj) = node.child_by_field_name("object") {
+                    Self::collect_receiver_steps(inner_obj, ast, steps);
+                }
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = ast.node_text(&name_node).to_string();
+                    let arg_count = node.child_by_field_name("arguments").map(|args| {
+                        let mut cursor = args.walk();
+                        args.children(&mut cursor).filter(|c| c.is_named()).count()
+                    }).unwrap_or(0);
+                    steps.push(ReceiverStep::MethodCall { name, arg_count });
+                }
+            }
+            "field_access" => {
+                if let Some(inner_obj) = node.child_by_field_name("object") {
+                    Self::collect_receiver_steps(inner_obj, ast, steps);
+                }
+                if let Some(field_node) = node.child_by_field_name("field") {
+                    let name = ast.node_text(&field_node).to_string();
+                    steps.push(ReceiverStep::FieldAccess(name));
+                }
+            }
+            "this" => {
+                steps.push(ReceiverStep::This);
+            }
+            "super" => {
+                steps.push(ReceiverStep::Super);
+            }
+            _ => {
+                let text = ast.node_text(&node).to_string();
+                steps.push(ReceiverStep::Identifier(text));
+            }
+        }
+    }
+
+    /// If cursor is at or on a method invocation or field access member name,
+    /// return detailed MemberAccessInfo including receiver expression chain steps and method argument count.
+    pub fn find_member_access_info(&self, line: u32, character: u32) -> Option<MemberAccessInfo> {
+        let root = self.tree.root_node();
+        let byte_col = self.utf16_col_to_byte(line, character);
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: byte_col,
+        };
+
+        fn point_in_node(pt: tree_sitter::Point, node: &Node) -> bool {
+            let start = node.start_position();
+            let end = node.end_position();
+            (pt.row > start.row || (pt.row == start.row && pt.column >= start.column))
+                && (pt.row < end.row || (pt.row == end.row && pt.column <= end.column))
+        }
+
+        let mut curr = root.descendant_for_point_range(point, point);
+        while let Some(n) = curr {
+            if n.kind() == "method_invocation" {
+                if let Some(name_n) = n.child_by_field_name("name") {
+                    if point_in_node(point, &name_n) {
+                        let m_name = self.node_text(&name_n).to_string();
+                        let recv = n.child_by_field_name("object").map(|obj| self.node_text(&obj).to_string());
+                        let mut steps = Vec::new();
+                        if let Some(obj) = n.child_by_field_name("object") {
+                            Self::collect_receiver_steps(obj, self, &mut steps);
+                        }
+                        let arg_count = n.child_by_field_name("arguments").map(|args| {
+                            let mut cursor = args.walk();
+                            args.children(&mut cursor).filter(|c| c.is_named()).count()
+                        });
+                        return Some(MemberAccessInfo {
+                            receiver: recv,
+                            receiver_steps: steps,
+                            member_name: m_name,
+                            is_method: true,
+                            arg_count,
+                        });
+                    }
+                }
+            } else if n.kind() == "field_access" {
+                if let Some(field_n) = n.child_by_field_name("field") {
+                    if point_in_node(point, &field_n) {
+                        let f_name = self.node_text(&field_n).to_string();
+                        let recv = n.child_by_field_name("object").map(|obj| self.node_text(&obj).to_string());
+                        let mut steps = Vec::new();
+                        if let Some(obj) = n.child_by_field_name("object") {
+                            Self::collect_receiver_steps(obj, self, &mut steps);
+                        }
+                        return Some(MemberAccessInfo {
+                            receiver: recv,
+                            receiver_steps: steps,
+                            member_name: f_name,
+                            is_method: false,
+                            arg_count: None,
+                        });
+                    }
+                }
+            } else if n.kind() == "scoped_identifier" {
+                // e.g. Config.TIMEOUT where Config is scope and TIMEOUT is name
+                if let Some(name_n) = n.child_by_field_name("name") {
+                    if point_in_node(point, &name_n) {
+                        let f_name = self.node_text(&name_n).to_string();
+                        let recv = n.child_by_field_name("scope").map(|s| self.node_text(&s).to_string());
+                        let mut steps = Vec::new();
+                        if let Some(scope_node) = n.child_by_field_name("scope") {
+                            Self::collect_receiver_steps(scope_node, self, &mut steps);
+                        }
+                        return Some(MemberAccessInfo {
+                            receiver: recv,
+                            receiver_steps: steps,
+                            member_name: f_name,
+                            is_method: false,
+                            arg_count: None,
+                        });
+                    }
+                }
+            }
+            curr = n.parent();
+        }
+
+        // If cursor is on a plain identifier, check if it's not a definition or declaration
+        let curr_node = root.descendant_for_point_range(point, point)?;
+        if curr_node.kind() == "identifier" {
+            let p_kind = curr_node.parent().map(|p| p.kind()).unwrap_or("");
+            if p_kind != "variable_declarator" && p_kind != "method_declaration" && p_kind != "class_declaration" {
+                let name = self.node_text(&curr_node).to_string();
+                return Some(MemberAccessInfo {
+                    receiver: None,
+                    receiver_steps: Vec::new(),
+                    member_name: name,
+                    is_method: false,
+                    arg_count: None,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// If cursor is at or on a method invocation or field access member name,
+    /// return (receiver_object_text, member_name, is_method).
+    /// receiver_object_text is None for implicit 'this' or same-class member calls/references like `foo()` or `MY_CONST`
+    pub fn find_member_access_receiver(&self, line: u32, character: u32) -> Option<(Option<String>, String, bool)> {
+        self.find_member_access_info(line, character)
+            .map(|info| (info.receiver, info.member_name, info.is_method))
     }
 
     /// If cursor is at or on a method invocation's name, return (receiver_object_text, method_name)
     /// receiver_object_text is None for implicit 'this' calls like `foo()`
     pub fn find_method_call_receiver(&self, line: u32, character: u32) -> Option<(Option<String>, String)> {
+        self.find_member_access_receiver(line, character).and_then(|(recv, name, is_method)| {
+            if is_method {
+                Some((recv, name))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Check if cursor position is right after a dot (e.g. `obj.` or `foo.bar.`) or typing a member identifier after dot
+    pub fn is_after_dot_access(&self, line: u32, character: u32) -> bool {
         let root = self.tree.root_node();
+        let byte_col = self.utf16_col_to_byte(line, character);
         let point = tree_sitter::Point {
             row: line as usize,
-            column: character as usize,
+            column: byte_col,
         };
         let mut curr = root.descendant_for_point_range(point, point);
         while let Some(n) = curr {
-            if n.kind() == "method_invocation" {
-                if let Some(name_n) = n.child_by_field_name("name") {
-                    let m_name = self.node_text(&name_n).to_string();
-                    let recv = n.child_by_field_name("object").map(|obj| self.node_text(&obj).to_string());
-                    return Some((recv, m_name));
+            let k = n.kind();
+            if k == "field_access" || k == "method_invocation" {
+                return true;
+            }
+            curr = n.parent();
+        }
+
+        // Fast text inspection fallback with UTF-16 awareness
+        if let Some(line_str) = self.source.lines().nth(line as usize) {
+            let byte_limit = self.utf16_col_to_byte(line, character).min(line_str.len());
+            let prefix = line_str[..byte_limit].trim_end();
+            if prefix.ends_with('.') {
+                return true;
+            }
+            let before_ident = prefix.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+            return before_ident.ends_with('.');
+        }
+
+        false
+    }
+
+    /// Check if cursor position is preceded by `new ` keyword (for constructor instantiation completion)
+    pub fn is_after_new_expression(&self, line: u32, character: u32) -> bool {
+        let root = self.tree.root_node();
+        let byte_col = self.utf16_col_to_byte(line, character);
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: byte_col,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        while let Some(n) = curr {
+            if n.kind() == "object_creation_expression" {
+                return true;
+            }
+            curr = n.parent();
+        }
+
+        // Fast text inspection fallback with UTF-16 awareness
+        if let Some(line_str) = self.source.lines().nth(line as usize) {
+            let byte_limit = self.utf16_col_to_byte(line, character).min(line_str.len());
+            let prefix = line_str[..byte_limit].trim_end();
+            if prefix.ends_with("new") {
+                return true;
+            }
+            let before_ident = prefix.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '.');
+            let trimmed = before_ident.trim_end();
+            return trimmed.ends_with("new");
+        }
+
+        false
+    }
+
+    /// Extract receiver expression before dot when Tree-sitter collapses into an ERROR node (Fault Tolerance)
+    pub fn extract_receiver_before_dot_fallback(&self, line: u32, character: u32) -> Option<String> {
+        if let Some(line_str) = self.source.lines().nth(line as usize) {
+            let byte_limit = self.utf16_col_to_byte(line, character).min(line_str.len());
+            let prefix = line_str[..byte_limit].trim_end();
+            if let Some(dot_idx) = prefix.rfind('.') {
+                let expr_before_dot = prefix[..dot_idx].trim_end();
+                // Extract last identifier or chain, e.g. "user" in "user." or "order.getItem()"
+                let last_token = expr_before_dot
+                    .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+                    .filter(|s| !s.is_empty())
+                    .last();
+                return last_token.map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
+    /// Extract receiver chain steps before the current cursor position (for completion and resolution).
+    /// Works both when AST node is valid and during incomplete typing right after a dot (Fault Tolerant).
+    pub fn extract_receiver_steps_before_position(&self, line: u32, character: u32) -> Vec<ReceiverStep> {
+        // 1. Try AST-based member access info if cursor is on an existing member token
+        if let Some(info) = self.find_member_access_info(line, character) {
+            if !info.receiver_steps.is_empty() {
+                return info.receiver_steps;
+            }
+        }
+
+        // 2. Parse text immediately before cursor
+        let line_str = match self.source.lines().nth(line as usize) {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        let byte_limit = self.utf16_col_to_byte(line, character).min(line_str.len());
+        let prefix = &line_str[..byte_limit];
+
+        // Find the dot: strip any identifier currently being typed after dot
+        let dot_idx = match prefix.rfind('.') {
+            Some(idx) => idx,
+            None => return Vec::new(),
+        };
+
+        // Everything after the dot up to byte_limit must be a valid identifier prefix (or empty)
+        let suffix = &prefix[dot_idx + 1..];
+        if !suffix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Vec::new();
+        }
+
+        let before_dot = prefix[..dot_idx].trim_end();
+        if before_dot.is_empty() {
+            return Vec::new();
+        }
+
+        // Backward scan to find start of receiver expression
+        let bytes = before_dot.as_bytes();
+        let mut i = bytes.len();
+        let mut paren_depth: i32 = 0;
+        let mut bracket_depth: i32 = 0;
+
+        while i > 0 {
+            let b = bytes[i - 1];
+            if b == b')' {
+                paren_depth += 1;
+                i -= 1;
+            } else if b == b'(' {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                    i -= 1;
+                } else {
+                    break;
                 }
+            } else if b == b']' {
+                bracket_depth += 1;
+                i -= 1;
+            } else if b == b'[' {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                    i -= 1;
+                } else {
+                    break;
+                }
+            } else if paren_depth == 0 && bracket_depth == 0 {
+                if b.is_ascii_whitespace()
+                    || b == b';'
+                    || b == b','
+                    || b == b'='
+                    || b == b'{'
+                    || b == b'}'
+                    || b == b'?'
+                    || b == b':'
+                    || b == b'+'
+                    || b == b'-'
+                    || b == b'*'
+                    || b == b'/'
+                    || b == b'%'
+                    || b == b'&'
+                    || b == b'|'
+                    || b == b'^'
+                    || b == b'!'
+                    || b == b'<'
+                    || b == b'>'
+                {
+                    break;
+                }
+                i -= 1;
+            } else {
+                i -= 1;
+            }
+        }
+
+        let expr = before_dot[i..].trim();
+        if expr.is_empty() {
+            return Vec::new();
+        }
+
+        // Tokenize expr into ReceiverSteps by splitting on '.' with paren_depth == 0
+        let mut steps = Vec::new();
+        let mut start = 0;
+        let mut p_depth = 0;
+        let expr_bytes = expr.as_bytes();
+
+        for j in 0..expr_bytes.len() {
+            let b = expr_bytes[j];
+            if b == b'(' {
+                p_depth += 1;
+            } else if b == b')' {
+                if p_depth > 0 {
+                    p_depth -= 1;
+                }
+            } else if b == b'.' && p_depth == 0 {
+                let part = expr[start..j].trim();
+                if !part.is_empty() {
+                    Self::append_receiver_part(&mut steps, part);
+                }
+                start = j + 1;
+            }
+        }
+
+        if start < expr.len() {
+            let part = expr[start..].trim();
+            if !part.is_empty() {
+                Self::append_receiver_part(&mut steps, part);
+            }
+        }
+
+        steps
+    }
+
+    fn append_receiver_part(steps: &mut Vec<ReceiverStep>, part: &str) {
+        if part == "this" {
+            steps.push(ReceiverStep::This);
+        } else if part == "super" {
+            steps.push(ReceiverStep::Super);
+        } else if part.ends_with(')') {
+            if let Some(open_paren) = part.find('(') {
+                let name = part[..open_paren].trim().to_string();
+                let inner = part[open_paren + 1..part.len() - 1].trim();
+                let arg_count = if inner.is_empty() {
+                    0
+                } else {
+                    let mut count = 1;
+                    let mut depth = 0;
+                    for c in inner.chars() {
+                        if c == '(' || c == '[' || c == '{' {
+                            depth += 1;
+                        } else if c == ')' || c == ']' || c == '}' {
+                            if depth > 0 { depth -= 1; }
+                        } else if c == ',' && depth == 0 {
+                            count += 1;
+                        }
+                    }
+                    count
+                };
+                steps.push(ReceiverStep::MethodCall { name, arg_count });
+            } else {
+                steps.push(ReceiverStep::Identifier(part.to_string()));
+            }
+        } else {
+            if steps.is_empty() {
+                steps.push(ReceiverStep::Identifier(part.to_string()));
+            } else {
+                steps.push(ReceiverStep::FieldAccess(part.to_string()));
+            }
+        }
+    }
+
+    /// Extract receiver expression and replacement range for IntelliJ-style Postfix Completion
+    /// (e.g., `user.getName().sout` -> ("user.getName()", Range replacing `user.getName().sout`))
+    pub fn extract_postfix_receiver_and_range(&self, line: u32, character: u32) -> Option<(String, Range)> {
+        let line_str = self.source.lines().nth(line as usize)?;
+        let byte_limit = self.utf16_col_to_byte(line, character).min(line_str.len());
+        let prefix = &line_str[..byte_limit];
+
+        let dot_idx = prefix.rfind('.')?;
+        let suffix = &prefix[dot_idx + 1..];
+        // Suffix must be a valid identifier or empty
+        if !suffix.is_empty() && !suffix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+
+        let before_dot = prefix[..dot_idx].trim_end();
+        if before_dot.is_empty() {
+            return None;
+        }
+
+        let bytes = before_dot.as_bytes();
+        let mut i = bytes.len();
+        let mut paren_depth: i32 = 0;
+        let mut bracket_depth: i32 = 0;
+
+        while i > 0 {
+            let b = bytes[i - 1];
+            if b == b')' {
+                paren_depth += 1;
+                i -= 1;
+            } else if b == b'(' {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                    i -= 1;
+                } else {
+                    break;
+                }
+            } else if b == b']' {
+                bracket_depth += 1;
+                i -= 1;
+            } else if b == b'[' {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                    i -= 1;
+                } else {
+                    break;
+                }
+            } else if paren_depth == 0 && bracket_depth == 0 {
+                if b.is_ascii_whitespace()
+                    || b == b';'
+                    || b == b','
+                    || b == b'='
+                    || b == b'{'
+                    || b == b'}'
+                    || b == b'?'
+                    || b == b':'
+                    || b == b'+'
+                    || b == b'-'
+                    || b == b'*'
+                    || b == b'/'
+                    || b == b'%'
+                    || b == b'&'
+                    || b == b'|'
+                    || b == b'^'
+                    || b == b'!'
+                    || b == b'<'
+                    || b == b'>'
+                {
+                    break;
+                }
+                i -= 1;
+            } else {
+                i -= 1;
+            }
+        }
+
+        let expr = before_dot[i..].trim();
+        if expr.is_empty() {
+            return None;
+        }
+
+        let expr_start_col = self.byte_col_to_utf16(line, i);
+        let remaining = &line_str[byte_limit..];
+        let extra_ident_len = remaining
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        let end_byte = byte_limit + extra_ident_len;
+        let end_col = self.byte_col_to_utf16(line, end_byte);
+
+        Some((
+            expr.to_string(),
+            Range {
+                start: Position { line, character: expr_start_col },
+                end: Position { line, character: end_col },
+            },
+        ))
+    }
+
+    /// Check if cursor position is at a method, constructor, or field definition identifier,
+    /// returning the exact Range of the definition identifier if so.
+    pub fn get_definition_identifier_range(&self, line: u32, character: u32) -> Option<tower_lsp::lsp_types::Range> {
+        let root = self.tree.root_node();
+        let byte_col = self.utf16_col_to_byte(line, character);
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: byte_col,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        while let Some(n) = curr {
+            let k = n.kind();
+            if k == "method_declaration" || k == "constructor_declaration" {
+                if let Some(name_n) = n.child_by_field_name("name") {
+                    let start = name_n.start_position();
+                    let end = name_n.end_position();
+                    if point.row >= start.row && point.row <= end.row && point.column >= start.column && point.column <= end.column {
+                        return Some(tower_lsp::lsp_types::Range {
+                            start: tower_lsp::lsp_types::Position {
+                                line: start.row as u32,
+                                character: self.byte_col_to_utf16(start.row as u32, start.column),
+                            },
+                            end: tower_lsp::lsp_types::Position {
+                                line: end.row as u32,
+                                character: self.byte_col_to_utf16(end.row as u32, end.column),
+                            },
+                        });
+                    }
+                }
+                return None;
+            }
+            if k == "variable_declarator" {
+                if let Some(parent) = n.parent() {
+                    if parent.kind() == "field_declaration" {
+                        if let Some(name_n) = n.child_by_field_name("name") {
+                            let start = name_n.start_position();
+                            let end = name_n.end_position();
+                            if point.row >= start.row && point.row <= end.row && point.column >= start.column && point.column <= end.column {
+                                return Some(tower_lsp::lsp_types::Range {
+                                    start: tower_lsp::lsp_types::Position {
+                                        line: start.row as u32,
+                                        character: self.byte_col_to_utf16(start.row as u32, start.column),
+                                    },
+                                    end: tower_lsp::lsp_types::Position {
+                                        line: end.row as u32,
+                                        character: self.byte_col_to_utf16(end.row as u32, end.column),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+            if k == "class_declaration" || k == "interface_declaration" || k == "enum_declaration" {
+                return None;
             }
             curr = n.parent();
         }
         None
+    }
+
+    /// Check if cursor position is at a method, constructor, or field definition identifier
+    pub fn is_definition_node(&self, line: u32, character: u32) -> bool {
+        self.get_definition_identifier_range(line, character).is_some()
     }
 }
 
@@ -1507,6 +4717,7 @@ mod tests {
             public class Test {
                 public void run() {
                     System.out.println("hello", 42);
+                    User u = new User("admin", 123);
                 }
             }
         "#;
@@ -1514,9 +4725,18 @@ mod tests {
         // Row 3, column 40 (inside println arguments)
         let call = ast.find_method_call_at_position(3, 40);
         assert!(call.is_some());
-        let (method_name, param_idx) = call.unwrap();
+        let (method_name, param_idx, is_constructor) = call.unwrap();
         assert_eq!(method_name, "println");
         assert_eq!(param_idx, 0);
+        assert_eq!(is_constructor, false);
+
+        // Row 4, column 48 (inside new User arguments after comma)
+        let ctor_call = ast.find_method_call_at_position(4, 48);
+        assert!(ctor_call.is_some());
+        let (cls_name, ctor_param_idx, is_ctor) = ctor_call.unwrap();
+        assert_eq!(cls_name, "User");
+        assert_eq!(ctor_param_idx, 1);
+        assert_eq!(is_ctor, true);
     }
 
     #[test]
@@ -1643,8 +4863,26 @@ mod tests {
             assert!(errs.is_empty(), "Snippet {} has syntax errors: {:?}", idx, errs);
             let sem_errs = ast.collect_semantic_diagnostics();
             assert!(sem_errs.is_empty(), "Snippet {} has semantic errors: {:?}", idx, sem_errs);
-            println!("Snippet {} parsed with 0 errors.", idx);
+            let classes = ast.extract_classes(None);
+            println!("Snippet {} extracted classes: {:?}", idx, classes.iter().map(|c| (&c.simple_name, &c.fqn, &c.kind)).collect::<Vec<_>>());
+            assert!(!classes.is_empty(), "Snippet {} should extract class!", idx);
         }
+
+        let user_code = r#"package com.example;
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Controller
+@ResponseBody
+public @interface RestController {
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(user_code.to_string())).expect("Parse user code");
+        let classes = ast.extract_classes(None);
+        println!("User RestController extracted classes: {:?}", classes.iter().map(|c| (&c.simple_name, &c.fqn, &c.kind)).collect::<Vec<_>>());
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].simple_name, "RestController");
+        assert_eq!(classes[0].fqn, "com.example.RestController");
     }
 
     #[test]
@@ -1700,6 +4938,22 @@ mod tests {
         let (fix_title, stub_code) = stub_fix.unwrap();
         assert!(fix_title.contains("doProcess"), "Expected title to contain method name, got: {}", fix_title);
         assert!(stub_code.contains("void doProcess()"), "Expected stub to contain method signature, got: {}", stub_code);
+
+        // 3. Test that calling a method on another object (e.g. `b.bMethod()`) does NOT prompt Create method in enclosing class
+        let code_b = r#"
+            public class ClassA {
+                public void test() {
+                    ClassB b = new ClassB();
+                    b.bMethod();
+                }
+            }
+        "#;
+        let ast_b = JavaAst::parse(Arc::new(code_b.to_string())).expect("Parse code");
+        let lines_b: Vec<&str> = code_b.lines().collect();
+        let b_line = lines_b.iter().position(|l| l.contains("b.bMethod()")).unwrap() as u32;
+        let b_col = lines_b[b_line as usize].find("bMethod").unwrap() as u32;
+        let no_stub = ast_b.generate_create_method_stub_quickfix(b_line, b_col);
+        assert!(no_stub.is_none(), "Calling b.bMethod() should NOT suggest creating method in enclosing class");
     }
 
     #[test]
@@ -1728,6 +4982,378 @@ mod tests {
         let diags = ast.collect_semantic_diagnostics();
         let switch_diag = diags.iter().find(|(_, msg)| msg.contains("Switch expression does not cover all possible input values"));
         assert!(switch_diag.is_some(), "Expected missing default branch warning for switch expression");
+    }
+
+    #[test]
+    fn test_import_insertion_position_and_replacement() {
+        // Case 1: File with package and existing imports
+        let code1 = "package com.example.demo;\n\nimport java.util.List;\n\npublic class Demo {}";
+        let ast1 = JavaAst::parse(Arc::new(code1.to_string())).unwrap();
+        let (pos1, need_nl1) = ast1.find_import_insertion_position();
+        // Existing import is at line 2 -> new import should be at line 3, never before package (line 0)
+        assert!(pos1.line > 0, "Import must never be inserted before package");
+        assert_eq!(pos1.line, 3);
+        assert!(!need_nl1);
+
+        // Case 2: File with package but NO imports
+        let code2 = "package com.example.demo;\n\npublic class Demo {}";
+        let ast2 = JavaAst::parse(Arc::new(code2.to_string())).unwrap();
+        let (pos2, need_nl2) = ast2.find_import_insertion_position();
+        // Must insert after package line (line 0)
+        assert_eq!(pos2.line, 1);
+        assert!(need_nl2);
+
+        // Case 3: File with no package and no imports
+        let code3 = "public class Demo {}";
+        let ast3 = JavaAst::parse(Arc::new(code3.to_string())).unwrap();
+        let (pos3, _) = ast3.find_import_insertion_position();
+        assert_eq!(pos3.line, 0);
+    }
+
+    #[test]
+    fn test_organize_imports_with_static_and_wildcard() {
+        let code = r#"package com.example;
+
+import java.util.List;
+import java.util.Map;
+import java.io.*;
+import static java.util.Collections.emptyList;
+import static org.junit.Assert.*;
+import com.unused.UnusedClass;
+
+public class Demo {
+    private List<String> items;
+    public void run() {
+        emptyList();
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        let organized = ast.organize_imports();
+        // 1. Used imports must be present: List, emptyList
+        assert!(organized.contains(&"java.util.List".to_string()));
+        assert!(organized.contains(&"static java.util.Collections.emptyList".to_string()));
+        // 2. Wildcard imports must be preserved: java.io.*, static org.junit.Assert.*
+        assert!(organized.contains(&"java.io.*".to_string()));
+        assert!(organized.contains(&"static org.junit.Assert.*".to_string()));
+        // 3. Unused imports must be eliminated: Map, UnusedClass
+        assert!(!organized.contains(&"java.util.Map".to_string()));
+        assert!(!organized.contains(&"com.unused.UnusedClass".to_string()));
+    }
+
+    #[test]
+    fn test_is_definition_node_and_range() {
+        let code = r#"public class Person {
+    private String name;
+    public void doWork() {}
+    public Person() {}
+}"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        // Line 1: '    private String name;' -> 'name' is at col 19-23
+        assert!(ast.is_definition_node(1, 19));
+        assert!(ast.is_definition_node(1, 22));
+        assert!(!ast.is_definition_node(1, 10)); // 'String' type is not definition
+        let field_range = ast.get_definition_identifier_range(1, 19).unwrap();
+        assert_eq!(field_range.start.line, 1);
+        assert_eq!(field_range.start.character, 19);
+        assert_eq!(field_range.end.character, 23);
+
+        // Line 2: '    public void doWork() {}' -> 'doWork' is at col 16-22
+        assert!(ast.is_definition_node(2, 16));
+        assert!(ast.is_definition_node(2, 20));
+        assert!(!ast.is_definition_node(2, 8)); // 'void' is not definition
+
+        // Line 3: '    public Person() {}' -> 'Person' constructor is at col 11-17
+        assert!(ast.is_definition_node(3, 11));
+        assert!(ast.is_definition_node(3, 16));
+    }
+
+    #[test]
+    fn test_compiler_grade_static_diagnostics() {
+        // 1. Missing return statement in non-void method & returning value in void method
+        let code1 = r#"
+public class TestReturn {
+    public int missingReturn() {
+        int x = 10;
+    }
+    public void unexpectedReturn() {
+        return 42;
+    }
+    public int validReturn() {
+        if (true) {
+            return 1;
+        } else {
+            return 2;
+        }
+    }
+}
+"#;
+        let ast1 = JavaAst::parse(Arc::new(code1.to_string())).unwrap();
+        let diags1 = ast1.collect_semantic_diagnostics_detailed(Some("TestReturn"));
+        println!("DIAGS1 = {:#?}", diags1);
+        assert!(
+            diags1.iter().any(|d| d.code == DiagnosticCode::MissingReturn && d.message.to_lowercase().contains("missing return statement")),
+            "Expected missing return statement diagnostic for missingReturn(), got: {:?}",
+            diags1
+        );
+        assert!(
+            diags1.iter().any(|d| d.code == DiagnosticCode::UnexpectedReturn && d.message.to_lowercase().contains("cannot return a value from a method with void")),
+            "Expected unexpected return diagnostic for unexpectedReturn(), got: {:?}",
+            diags1
+        );
+        // validReturn should not trigger missing return
+        assert!(
+            !diags1.iter().any(|d| d.code == DiagnosticCode::MissingReturn && d.range.start.line >= 9),
+            "validReturn should not trigger missing return diagnostic"
+        );
+
+        // 2. Final variable reassignment
+        let code2 = r#"
+public class TestFinal {
+    public void test() {
+        final int x = 100;
+        x = 200;
+        x++;
+    }
+}
+"#;
+        let ast2 = JavaAst::parse(Arc::new(code2.to_string())).unwrap();
+        let diags2 = ast2.collect_semantic_diagnostics_detailed(Some("TestFinal"));
+        let final_errs: Vec<_> = diags2.iter().filter(|d| d.code == DiagnosticCode::FinalReassignment).collect();
+        assert_eq!(final_errs.len(), 2, "Expected 2 final reassignment errors (x = 200 and x++)");
+
+        // 3. Duplicate variable declaration in same block
+        let code3 = r#"
+public class TestDuplicate {
+    public void test() {
+        int count = 1;
+        String count = "dup";
+    }
+}
+"#;
+        let ast3 = JavaAst::parse(Arc::new(code3.to_string())).unwrap();
+        let diags3 = ast3.collect_semantic_diagnostics_detailed(Some("TestDuplicate"));
+        assert!(
+            diags3.iter().any(|d| d.code == DiagnosticCode::DuplicateVariable && d.message.to_lowercase().contains("is already defined")),
+            "Expected duplicate variable error for count, got: {:?}",
+            diags3
+        );
+
+        // 4. Static context violation (this/super in static method)
+        let code4 = r#"
+public class TestStatic {
+    private int val;
+    public static void run() {
+        int x = this.val;
+    }
+}
+"#;
+        let ast4 = JavaAst::parse(Arc::new(code4.to_string())).unwrap();
+        let diags4 = ast4.collect_semantic_diagnostics_detailed(Some("TestStatic"));
+        assert!(
+            diags4.iter().any(|d| d.code == DiagnosticCode::StaticContextViolation && d.message.to_lowercase().contains("static context")),
+            "Expected static context violation diagnostic, got: {:?}",
+            diags4
+        );
+
+        // 5. Public class name vs file name mismatch
+        let code5 = r#"
+public class FooService {
+}
+"#;
+        let ast5 = JavaAst::parse(Arc::new(code5.to_string())).unwrap();
+        let diags5 = ast5.collect_semantic_diagnostics_detailed(Some("BarService"));
+        assert!(
+            diags5.iter().any(|d| d.code == DiagnosticCode::PublicClassNameMismatch && d.message.contains("FooService.java")),
+            "Expected class name vs file name mismatch diagnostic, got: {:?}",
+            diags5
+        );
+    }
+
+    #[test]
+    fn test_tree_sitter_utf16_and_fault_tolerance() {
+        // 1. UTF-16 column vs UTF-8 byte conversion
+        // "String greeting = \"" is 19 ASCII chars (19 bytes, 19 UTF-16 units)
+        // "你好" is 2 chars, 6 bytes in UTF-8, 2 code units in UTF-16
+        let code = "String greeting = \"你好\";";
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        // Index right before "你好": line 0, 19 bytes
+        let byte_col = 19;
+        let utf16_col = ast.byte_col_to_utf16(0, byte_col);
+        assert_eq!(utf16_col, 19);
+        // After "你好" (19 + 6 = 25 bytes in UTF-8)
+        let byte_after = 25;
+        let utf16_after = ast.byte_col_to_utf16(0, byte_after);
+        // In UTF-16: 19 + 2 code units = 21
+        assert_eq!(utf16_after, 21);
+        // Convert back from UTF-16 col 21 -> byte 25
+        assert_eq!(ast.utf16_col_to_byte(0, 21), 25);
+
+        // 2. Fault tolerance for incomplete dot access (syntax error when typing)
+        let incomplete_code = r#"
+public class TestIncomplete {
+    public void run() {
+        User user = new User();
+        user.
+    }
+}
+"#;
+        let ast_inc = JavaAst::parse(Arc::new(incomplete_code.to_string())).unwrap();
+        // Line 4 is '        user.'
+        assert!(ast_inc.is_after_dot_access(4, 13));
+        let recv = ast_inc.extract_receiver_before_dot_fallback(4, 13);
+        assert_eq!(recv, Some("user".to_string()));
+    }
+
+    #[test]
+    fn test_instanceof_pattern_ast() {
+        let code = r#"
+class Test {
+    void foo(Object obj) {
+        if (obj instanceof Point(int x, int y)) {
+            System.out.println(x + y);
+        }
+        if (obj instanceof String s) {
+            System.out.println(s);
+        }
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        fn dump_nodes(n: tree_sitter::Node, ast: &JavaAst, depth: usize) {
+            let indent = "  ".repeat(depth);
+            println!("{}{} [{}]", indent, n.kind(), ast.node_text(&n));
+            let mut cursor = n.walk();
+            for c in n.children(&mut cursor) {
+                dump_nodes(c, ast, depth + 1);
+            }
+        }
+        dump_nodes(ast.tree.root_node(), &ast, 0);
+    }
+
+    #[test]
+    fn test_annotation_parsing() {
+        let code1 = r#"
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Controller
+@ResponseBody
+public @interface RestController {
+}
+"#;
+        let ast1 = JavaAst::parse(Arc::new(code1.to_string())).unwrap();
+        let classes1 = ast1.extract_classes(None);
+        println!("classes1 = {:?}", classes1);
+        assert_eq!(classes1.len(), 1);
+        assert_eq!(classes1[0].simple_name, "RestController");
+        assert_eq!(classes1[0].kind, ClassKind::Annotation);
+
+        let code2 = r#"
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Controller
+@ResponseBody
+public @interface RestController
+"#;
+        let ast2 = JavaAst::parse(Arc::new(code2.to_string())).unwrap();
+        fn dump(n: tree_sitter::Node, ast: &JavaAst, depth: usize) {
+            let indent = "  ".repeat(depth);
+            println!("{}{} [{}]", indent, n.kind(), ast.node_text(&n));
+            let mut cursor = n.walk();
+            for c in n.children(&mut cursor) {
+                dump(c, ast, depth + 1);
+            }
+        }
+        dump(ast2.tree.root_node(), &ast2, 0);
+        let classes2 = ast2.extract_classes(None);
+        println!("classes2 = {:?}", classes2);
+        let errors2 = ast2.collect_syntax_errors();
+        println!("errors2 = {:?}", errors2);
+    }
+
+    #[test]
+    fn test_anonymous_class_return_inside_void_method() {
+        let code = r#"
+class Demo {
+    public void deleteDir(Path path) throws IOException {
+        Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                Files.delete(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        let diags = ast.collect_semantic_diagnostics_detailed(Some("Demo"));
+        let unexpected_return: Vec<_> = diags.iter().filter(|d| d.code == DiagnosticCode::UnexpectedReturn).collect();
+        assert!(unexpected_return.is_empty(), "Should NOT flag return in anonymous class as returning from void method! Found: {:?}", unexpected_return);
+    }
+
+    #[test]
+    fn test_unhandled_exception_with_throws_declaration() {
+        let code = r#"
+class Demo {
+    public static void copyFile(File src, File dest) throws IOException {
+        ensureDirectory(dest.getParent());
+        Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        let diags = ast.collect_semantic_diagnostics_detailed(Some("Demo"));
+        for d in &diags {
+            eprintln!("DIAG: {:?} - {}", d.code, d.message);
+        }
+        let unhandled: Vec<_> = diags.iter().filter(|d| d.code == DiagnosticCode::UnhandledException).collect();
+        assert!(unhandled.is_empty(), "Should NOT flag Files.copy when method declares throws IOException! Found: {:?}", unhandled);
+    }
+
+    #[test]
+    fn test_void_method_type_node() {
+        let code = r#"
+class Demo {
+    public static void copyFile(File src, File dest) throws IOException {
+        Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        let method = ast.tree.root_node().named_child(0).unwrap().named_child(1).unwrap().named_child(0).unwrap();
+        println!("method kind: {}", method.kind());
+        println!("method type field: {:?}", method.child_by_field_name("type"));
+        for child in method.children(&mut method.walk()) {
+            println!("child kind: {}, text: {:?}", child.kind(), ast.node_text(&child));
+        }
+    }
+
+    #[test]
+    fn test_incremental_parse_desync() {
+        let code1 = r#"
+class Demo {
+    public static void copyFile(File src, File dest) throws IOException {
+        ensureDirectory(dest.getParent());
+        Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+}
+"#;
+        let ast1 = JavaAst::parse(Arc::new(code1.to_string())).unwrap();
+
+        let code2 = r#"
+class Demo {
+    public static void copyFile(File src, File dest) throws IOException {
+        Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+}
+"#;
+        let ast2 = JavaAst::parse_incremental(Arc::new(code2.to_string()), Some(&ast1.tree)).unwrap();
+        let diags2 = ast2.collect_semantic_diagnostics_detailed(Some("Demo"));
+        let missing_ret: Vec<_> = diags2.iter().filter(|d| d.code == DiagnosticCode::MissingReturn).collect();
+        assert!(missing_ret.is_empty(), "Should NOT report missing return on void method after incremental edit! Found: {:?}", missing_ret);
     }
 }
 

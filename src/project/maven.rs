@@ -10,8 +10,16 @@ pub struct PomProject {
     pub group_id: Option<String>,
     pub artifact_id: Option<String>,
     pub version: Option<String>,
+    pub dependency_management: Option<PomDependencyManagement>,
     pub dependencies: Option<PomDependencies>,
     pub modules: Option<PomModules>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PomDependencyManagement {
+    #[serde(default)]
+    pub dependencies: Option<PomDependencies>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +49,40 @@ pub struct MavenProject {
     pub pom_path: PathBuf,
     pub dependencies: Vec<PomDependency>,
     pub modules: Vec<String>,
+    pub properties: std::collections::HashMap<String, String>,
+}
+
+pub fn extract_pom_properties(content: &str) -> std::collections::HashMap<String, String> {
+    let mut props = std::collections::HashMap::new();
+    if let Some(start) = content.find("<properties>") {
+        if let Some(end) = content[start..].find("</properties>") {
+            let inner = &content[start + 12..start + end];
+            for line in inner.lines() {
+                let trimmed = line.trim();
+                if let (Some(open_end), Some(close_start)) = (trimmed.find('>'), trimmed.rfind("</")) {
+                    if open_end < close_start && trimmed.starts_with('<') {
+                        let tag = &trimmed[1..open_end];
+                        let val = &trimmed[open_end + 1..close_start];
+                        if !tag.is_empty() && !tag.contains(' ') {
+                            props.insert(tag.to_string(), val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    props
+}
+
+fn substitute_property(val: &str, props: &std::collections::HashMap<String, String>) -> String {
+    let mut result = val.to_string();
+    for (k, v) in props {
+        let pattern = format!("${{{}}}", k);
+        if result.contains(&pattern) {
+            result = result.replace(&pattern, v);
+        }
+    }
+    result
 }
 
 impl MavenProject {
@@ -51,12 +93,61 @@ impl MavenProject {
         let pom: PomProject = from_str(&content)
             .map_err(|e| format!("Failed to parse pom.xml: {e}"))?;
 
-        let dependencies = pom.dependencies.map(|d| d.dependency).unwrap_or_default();
+        let mut properties = extract_pom_properties(&content);
+        if let Some(ver) = &pom.version {
+            properties.insert("project.version".to_string(), ver.clone());
+        }
+        if let Some(gid) = &pom.group_id {
+            properties.insert("project.groupId".to_string(), gid.clone());
+        }
+
+        // Check if parent pom.xml exists to inherit properties
+        if let Some(parent_dir) = pom_path.as_ref().parent() {
+            if let Some(grandparent) = parent_dir.parent() {
+                let parent_pom = grandparent.join("pom.xml");
+                if parent_pom.exists() && parent_pom != pom_path.as_ref() {
+                    if let Ok(parent_content) = fs::read_to_string(&parent_pom) {
+                        for (k, v) in extract_pom_properties(&parent_content) {
+                            properties.entry(k).or_insert(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build BOM mapping from dependencyManagement
+        let mut bom_map = std::collections::HashMap::new();
+        if let Some(dm) = pom.dependency_management {
+            if let Some(deps) = dm.dependencies {
+                for d in deps.dependency {
+                    if let Some(ver) = d.version {
+                        let resolved_ver = substitute_property(&ver, &properties);
+                        bom_map.insert((d.group_id, d.artifact_id), resolved_ver);
+                    }
+                }
+            }
+        }
+
+        let mut dependencies = pom.dependencies.map(|d| d.dependency).unwrap_or_default();
+        for dep in &mut dependencies {
+            dep.group_id = substitute_property(&dep.group_id, &properties);
+            dep.artifact_id = substitute_property(&dep.artifact_id, &properties);
+            if dep.version.is_none() {
+                if let Some(bom_ver) = bom_map.get(&(dep.group_id.clone(), dep.artifact_id.clone())) {
+                    dep.version = Some(bom_ver.clone());
+                }
+            }
+            if let Some(v) = &mut dep.version {
+                *v = substitute_property(v, &properties);
+            }
+        }
+
         let modules = pom.modules.map(|m| m.module).unwrap_or_default();
         Ok(Self {
             pom_path: pom_path.as_ref().to_path_buf(),
             dependencies,
             modules,
+            properties,
         })
     }
 
@@ -78,7 +169,7 @@ impl MavenProject {
         jars
     }
 
-    /// Locate jar files in local Maven repository (~/.m2/repository)
+    /// Locate jar files in local Maven repository (~/.m2/repository), including test scope
     pub fn resolve_local_jars(&self) -> Vec<PathBuf> {
         let mut jars = Vec::new();
         let home = match std::env::var("HOME") {
@@ -91,12 +182,8 @@ impl MavenProject {
         }
 
         for dep in &self.dependencies {
+            let group_path = dep.group_id.replace('.', "/");
             if let Some(version) = &dep.version {
-                // Ignore test scope or system scope for now
-                if dep.scope.as_deref() == Some("test") {
-                    continue;
-                }
-                let group_path = dep.group_id.replace('.', "/");
                 let jar_file_name = format!("{}-{}.jar", dep.artifact_id, version);
                 let candidate = m2_repo
                     .join(&group_path)
@@ -108,13 +195,86 @@ impl MavenProject {
                     info!("Resolved Maven dependency: {:?}", candidate);
                     jars.push(candidate);
                 }
+            } else {
+                // If version is managed by parent POM or BOM, find latest version in ~/.m2
+                let artifact_dir = m2_repo.join(&group_path).join(&dep.artifact_id);
+                if artifact_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&artifact_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                let ver = p.file_name().unwrap_or_default().to_string_lossy();
+                                let jar = p.join(format!("{}-{}.jar", dep.artifact_id, ver));
+                                if jar.exists() && !jars.contains(&jar) {
+                                    info!("Resolved unversioned Maven dependency: {:?}", jar);
+                                    jars.push(jar);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If Spring Boot starter is in dependencies, resolve core Spring transitive jars in ~/.m2
+        let has_spring = self.dependencies.iter().any(|d| d.group_id.contains("springframework") || d.artifact_id.contains("spring-boot-starter"));
+        if has_spring {
+            let spring_repo = m2_repo.join("org").join("springframework");
+            if spring_repo.exists() {
+                for sub in &["spring-web", "spring-webmvc", "spring-context", "spring-beans", "spring-core"] {
+                    let sub_dir = spring_repo.join(sub);
+                    if sub_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.is_dir() {
+                                    let ver = p.file_name().unwrap_or_default().to_string_lossy();
+                                    let jar = p.join(format!("{}-{}.jar", sub, ver));
+                                    if jar.exists() && !jars.contains(&jar) {
+                                        info!("Resolved transitive Spring dependency: {:?}", jar);
+                                        jars.push(jar);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If MyBatis or MyBatis-Plus is in dependencies, resolve mybatis core and mybatis-spring jars in ~/.m2
+        let has_mybatis = self.dependencies.iter().any(|d| d.group_id.contains("mybatis") || d.artifact_id.contains("mybatis"));
+        if has_mybatis {
+            let mybatis_repo = m2_repo.join("org").join("mybatis");
+            if mybatis_repo.exists() {
+                for sub in &["mybatis", "mybatis-spring"] {
+                    let sub_dir = mybatis_repo.join(sub);
+                    if sub_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.is_dir() {
+                                    let ver = p.file_name().unwrap_or_default().to_string_lossy();
+                                    let jar = p.join(format!("{}-{}.jar", sub, ver));
+                                    if jar.exists() && !jars.contains(&jar) {
+                                        info!("Resolved transitive MyBatis dependency: {:?}", jar);
+                                        jars.push(jar);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
         jars
     }
 
-    /// Resolve jars locally or download from Maven Central if missing
+    /// Resolve jars locally or download from Maven Central if missing (including test scope)
     pub async fn resolve_and_download_jars(&self) -> Vec<PathBuf> {
         let mut jars = self.resolve_local_jars();
         let home = match std::env::var("HOME") {
@@ -125,9 +285,6 @@ impl MavenProject {
 
         for dep in &self.dependencies {
             if let Some(version) = &dep.version {
-                if dep.scope.as_deref() == Some("test") {
-                    continue;
-                }
                 let group_path = dep.group_id.replace('.', "/");
                 let jar_file_name = format!("{}-{}.jar", dep.artifact_id, version);
                 let target_path = m2_repo
@@ -215,5 +372,58 @@ mod tests {
         assert_eq!(deps[0].group_id, "org.slf4j");
         assert_eq!(deps[0].artifact_id, "slf4j-api");
         assert_eq!(deps[0].version, Some("2.0.7".to_string()));
+    }
+
+    #[test]
+    fn test_maven_properties_substitution_and_bom() {
+        let temp_dir = std::env::temp_dir().join(format!("jlsp_maven_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let pom_file = temp_dir.join("pom.xml");
+        let xml = r#"
+            <project>
+                <groupId>com.example</groupId>
+                <artifactId>app</artifactId>
+                <version>2.0.0</version>
+                <properties>
+                    <spring.version>6.1.2</spring.version>
+                    <junit.version>5.10.1</junit.version>
+                </properties>
+                <dependencyManagement>
+                    <dependencies>
+                        <dependency>
+                            <groupId>org.springframework</groupId>
+                            <artifactId>spring-web</artifactId>
+                            <version>${spring.version}</version>
+                        </dependency>
+                    </dependencies>
+                </dependencyManagement>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.springframework</groupId>
+                        <artifactId>spring-web</artifactId>
+                    </dependency>
+                    <dependency>
+                        <groupId>org.junit.jupiter</groupId>
+                        <artifactId>junit-jupiter</artifactId>
+                        <version>${junit.version}</version>
+                        <scope>test</scope>
+                    </dependency>
+                </dependencies>
+            </project>
+        "#;
+        std::fs::write(&pom_file, xml).unwrap();
+        let proj = MavenProject::parse(&pom_file).expect("Parse should succeed");
+
+        assert_eq!(proj.dependencies.len(), 2);
+        // Spring web should get resolved version 6.1.2 from dependencyManagement + property
+        let spring_dep = proj.dependencies.iter().find(|d| d.artifact_id == "spring-web").unwrap();
+        assert_eq!(spring_dep.version, Some("6.1.2".to_string()));
+
+        // JUnit should get substituted version 5.10.1 and retain test scope
+        let junit_dep = proj.dependencies.iter().find(|d| d.artifact_id == "junit-jupiter").unwrap();
+        assert_eq!(junit_dep.version, Some("5.10.1".to_string()));
+        assert_eq!(junit_dep.scope.as_deref(), Some("test"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

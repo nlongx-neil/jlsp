@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Position {
     pub line: u32,
     pub character: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     pub start: Position,
     pub end: Position,
@@ -62,6 +62,8 @@ pub struct MethodInfo {
     pub is_public: bool,
     pub is_constructor: bool,
     pub javadoc: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,9 +72,10 @@ pub struct FieldInfo {
     pub field_type: TypeSignature,
     pub is_static: bool,
     pub is_public: bool,
+    pub is_final: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClassKind {
     Class,
     Interface,

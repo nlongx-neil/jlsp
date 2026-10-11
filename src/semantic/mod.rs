@@ -15,10 +15,35 @@ pub struct SemanticContext<'a> {
     pub package: Option<String>,
     pub imports: Vec<String>,
     pub local_classes: HashMap<String, ClassInfo>,
+    pub indexer: Option<&'a crate::indexer::WorkspaceIndex>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GotoTarget {
+    /// Local definition in current file at specific range
+    Local(Range),
+    /// External class (from JDK, library JAR, or classpath) with optional member/target name
+    External {
+        cls: Arc<ClassInfo>,
+        target_name: Option<String>,
+    },
+    /// Known workspace source file on disk
+    SourceFile {
+        path: String,
+        range: Range,
+    },
 }
 
 impl<'a> SemanticContext<'a> {
     pub async fn new(ast: &'a JavaAst, classpath: &'a ClasspathRegistry) -> Self {
+        Self::with_indexer(ast, classpath, None).await
+    }
+
+    pub async fn with_indexer(
+        ast: &'a JavaAst,
+        classpath: &'a ClasspathRegistry,
+        indexer: Option<&'a crate::indexer::WorkspaceIndex>,
+    ) -> Self {
         let package = ast.extract_package();
         let imports = ast.extract_imports();
         let classes = ast.extract_classes(None);
@@ -26,14 +51,24 @@ impl<'a> SemanticContext<'a> {
         let mut local_classes = HashMap::new();
         for mut cls in classes {
             // Apply Lombok synthetic methods if present
-            lombok::process_lombok_annotations(&mut cls, &ast.source);
+            let lombok_generated = lombok::process_lombok_annotations(&mut cls, &ast.source);
+            let apt_generated = apt_jdwp::AnnotationProcessorRunner::process_apt_annotations(&mut cls, &ast.source);
             local_classes.insert(cls.simple_name.clone(), cls.clone());
             local_classes.insert(cls.fqn.clone(), cls);
+            for gen_cls in apt_generated {
+                local_classes.insert(gen_cls.simple_name.clone(), gen_cls.clone());
+                local_classes.insert(gen_cls.fqn.clone(), gen_cls);
+            }
+            for gen_cls in lombok_generated {
+                local_classes.insert(gen_cls.simple_name.clone(), gen_cls.clone());
+                local_classes.insert(gen_cls.fqn.clone(), gen_cls);
+            }
         }
 
         Self {
             ast,
             classpath,
+            indexer,
             package,
             imports,
             local_classes,
@@ -41,43 +76,77 @@ impl<'a> SemanticContext<'a> {
     }
 
     /// Resolve simple type name (e.g. "String" or "List") into full ClassInfo
-    pub async fn resolve_type(&self, type_name: &str) -> Option<Arc<ClassInfo>> {
+    pub async fn resolve_type(&self, raw_type_name: &str) -> Option<Arc<ClassInfo>> {
+        let type_name = raw_type_name.trim();
         // 1. Primitive check
         if matches!(type_name, "int" | "long" | "boolean" | "byte" | "short" | "char" | "float" | "double" | "void") {
             return None;
         }
 
+        // Extract simple name for fallback (handles "pkg.Foo" as well as syntax recovery "Foo.\n Foo")
+        let simple_name = type_name.split_whitespace().last().unwrap_or(type_name).split('.').last().unwrap_or(type_name);
+
         // 2. Check local classes in current file
-        if let Some(cls) = self.local_classes.get(type_name) {
+        if let Some(cls) = self.local_classes.get(type_name).or_else(|| self.local_classes.get(simple_name)) {
             return Some(Arc::new(cls.clone()));
+        }
+
+        // 2.5 Check exact FQN in classpath
+        if type_name.contains('.') {
+            if let Some(cls) = self.classpath.get_class(type_name).await {
+                return Some(cls);
+            }
+            if let Some(idx) = self.indexer {
+                if let Some(sym) = idx.find_by_fqn(type_name).await {
+                    return Some(Arc::new(sym.class_info));
+                }
+            }
         }
 
         // 3. Check explicit imports (e.g., import java.util.List;)
         for imp in &self.imports {
-            if (imp.ends_with(&format!(".{type_name}")) || imp == type_name)
-                && let Some(cls) = self.classpath.get_class(imp).await {
+            if imp.ends_with(&format!(".{simple_name}")) || imp == simple_name {
+                if let Some(cls) = self.classpath.get_class(imp).await {
                     return Some(cls);
                 }
+                if let Some(idx) = self.indexer {
+                    if let Some(sym) = idx.find_by_fqn(imp).await {
+                        return Some(Arc::new(sym.class_info));
+                    }
+                }
+            }
         }
 
         // 4. Check same package
         if let Some(pkg) = &self.package {
-            let fqn = format!("{pkg}.{type_name}");
+            let fqn = format!("{pkg}.{simple_name}");
             if let Some(cls) = self.classpath.get_class(&fqn).await {
                 return Some(cls);
+            }
+            if let Some(idx) = self.indexer {
+                if let Some(sym) = idx.find_by_fqn(&fqn).await {
+                    return Some(Arc::new(sym.class_info));
+                }
             }
         }
 
         // 5. Check java.lang default package
-        let java_lang_fqn = format!("java.lang.{type_name}");
+        let java_lang_fqn = format!("java.lang.{simple_name}");
         if let Some(cls) = self.classpath.get_class(&java_lang_fqn).await {
             return Some(cls);
         }
 
         // 6. Search registry by simple name
-        let found = self.classpath.find_classes_by_simple_name(type_name).await;
+        let found = self.classpath.find_classes_by_simple_name(simple_name).await;
         if let Some(first) = found.into_iter().next() {
             return Some(first);
+        }
+
+        // 7. Search workspace index candidates by simple name and package context
+        if let Some(idx) = self.indexer {
+            if let Some(sym) = idx.find_candidate(simple_name, self.package.as_deref(), &self.imports).await {
+                return Some(Arc::new(sym.class_info));
+            }
         }
 
         None
@@ -151,6 +220,36 @@ impl<'a> SemanticContext<'a> {
         unique
     }
 
+    /// Recursively collect all fields for a given class including superclasses
+    pub async fn get_all_fields_with_inheritance(&self, cls: &ClassInfo) -> Vec<crate::model::FieldInfo> {
+        let mut fields = cls.fields.clone();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(cls.fqn.clone());
+
+        let mut curr_super = cls.super_class.clone();
+        while let Some(super_name) = curr_super {
+            if !visited.insert(super_name.clone()) {
+                break;
+            }
+            if let Some(super_info) = self.resolve_type(&super_name).await {
+                fields.extend(super_info.fields.clone());
+                curr_super = super_info.super_class.clone();
+            } else {
+                break;
+            }
+        }
+
+        // Deduplicate fields by name
+        let mut unique = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for f in fields {
+            if seen.insert(f.name.clone()) {
+                unique.push(f);
+            }
+        }
+        unique
+    }
+
     /// Find implementations/subclasses of a given class or interface
     pub async fn find_implementations(&self, target_name: &str) -> Vec<ClassInfo> {
         let mut impls = Vec::new();
@@ -219,20 +318,68 @@ impl<'a> SemanticContext<'a> {
         missing_by_class
     }
 
-    /// Find AST node at specific line and column
+    /// Find AST node at specific line and column (aligned with UTF-16)
     pub fn find_node_at_position(&self, line: u32, character: u32) -> Option<Node<'_>> {
-        let root = self.ast.tree.root_node();
-        let point = tree_sitter::Point {
-            row: line as usize,
-            column: character as usize,
-        };
-        root.descendant_for_point_range(point, point)
+        self.ast.find_node_with_recovery(line, character)
     }
 
-    /// Resolve definition at given cursor location
-    pub async fn goto_definition(&self, line: u32, character: u32) -> Option<(String, Range)> {
+    /// Resolve semantic definition target (Local, SourceFile, or External JDK/Jar Class)
+    pub async fn resolve_goto_target(&self, line: u32, character: u32) -> Option<GotoTarget> {
         let node = self.find_node_at_position(line, character)?;
         let ident_text = self.ast.node_text(&node);
+
+        // 0. Check if cursor is inside an import declaration
+        let mut is_import = false;
+        let mut curr = Some(node);
+        while let Some(n) = curr {
+            if n.kind() == "import_declaration" {
+                is_import = true;
+                break;
+            }
+            curr = n.parent();
+        }
+
+        if is_import {
+            // Check direct type resolution on the identifier under cursor
+            if let Some(cls) = self.resolve_type(ident_text).await {
+                if self.local_classes.contains_key(&cls.simple_name) {
+                    if let Some(sym) = self.ast.extract_symbols().into_iter().find(|s| s.name == cls.simple_name && s.kind == crate::model::SymbolKind::Class) {
+                        return Some(GotoTarget::Local(sym.selection_range));
+                    }
+                }
+                if let Some(ref sp) = cls.source_path {
+                    if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                        return Some(GotoTarget::SourceFile {
+                            path: sp.clone(),
+                            range: Range::default(),
+                        });
+                    }
+                }
+                return Some(GotoTarget::External {
+                    cls,
+                    target_name: None,
+                });
+            }
+
+            // Check matching import statement on this line
+            for (imp_range, imp_str) in self.ast.extract_imports_with_ranges() {
+                if imp_range.start.line <= line && line <= imp_range.end.line {
+                    let clean = imp_str.trim_start_matches("static ").trim_end_matches(".*").trim();
+                    if let Some(cls) = self.classpath.get_class(clean).await {
+                        return Some(GotoTarget::External {
+                            cls,
+                            target_name: None,
+                        });
+                    }
+                    if let Some(cls) = self.resolve_type(clean).await {
+                        return Some(GotoTarget::External {
+                            cls,
+                            target_name: None,
+                        });
+                    }
+                }
+            }
+        }
 
         // 1. Check if cursor is at a method invocation (e.g. `obj.process()` or `process()`)
         if let Some((recv_opt, m_name)) = self.ast.find_method_call_receiver(line, character) {
@@ -293,51 +440,91 @@ impl<'a> SemanticContext<'a> {
                                     && sym.kind == crate::model::SymbolKind::Method
                                     && sym.container_name.as_deref() == Some(&local_cls.simple_name)
                                 {
-                                    return Some((String::new(), sym.selection_range));
+                                    return Some(GotoTarget::Local(sym.selection_range));
                                 }
                             }
-                        }
 
-                        // If not in local symbols or defined elsewhere (external file or JAR)
-                        if let Some(src_path) = &cls_info.source_path {
-                            let range = Range {
-                                start: crate::model::Position { line: 0, character: 0 },
-                                end: crate::model::Position { line: 0, character: 0 },
-                            };
-                            return Some((src_path.clone(), range));
+                            // Check Lombok synthetic getter/setter on local class
+                            if (m_name.starts_with("get") || m_name.starts_with("set")) && m_name.len() > 3 {
+                                let field_cand = format!("{}{}", m_name[3..4].to_lowercase(), &m_name[4..]);
+                                for sym in self.ast.extract_symbols() {
+                                    if sym.name == field_cand && sym.container_name.as_deref() == Some(&local_cls.simple_name) {
+                                        return Some(GotoTarget::Local(sym.selection_range));
+                                    }
+                                }
+                            } else if m_name.starts_with("is") && m_name.len() > 2 {
+                                let field_cand = format!("{}{}", m_name[2..3].to_lowercase(), &m_name[3..]);
+                                for sym in self.ast.extract_symbols() {
+                                    if sym.name == field_cand && sym.container_name.as_deref() == Some(&local_cls.simple_name) {
+                                        return Some(GotoTarget::Local(sym.selection_range));
+                                    }
+                                }
+                            }
+                        } else {
+                            // If defined in a project workspace source file
+                            if let Some(ref sp) = cls_info.source_path {
+                                if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                                    return Some(GotoTarget::SourceFile {
+                                        path: sp.clone(),
+                                        range: Range::default(),
+                                    });
+                                }
+                            }
+
+                            // External class (JDK or JAR library)
+                            return Some(GotoTarget::External {
+                                cls: cls_info,
+                                target_name: Some(m_name),
+                            });
                         }
                     }
                 }
             }
         }
 
-        // 2. Check if cursor is on a class identifier
+        // 2. Check if cursor is on a class/type identifier
         if let Some(cls) = self.resolve_type(ident_text).await {
-            let path = cls.source_path.clone().unwrap_or_default();
-            // Default to start of file
-            let range = Range {
-                start: crate::model::Position { line: 0, character: 0 },
-                end: crate::model::Position { line: 0, character: 0 },
-            };
-            return Some((path, range));
+            // Defined in current local file?
+            if let Some(local_cls) = self.local_classes.get(&cls.simple_name) {
+                for sym in self.ast.extract_symbols() {
+                    if sym.name == local_cls.simple_name && sym.kind == crate::model::SymbolKind::Class {
+                        return Some(GotoTarget::Local(sym.selection_range));
+                    }
+                }
+            }
+
+            // Defined in a project workspace source file?
+            if let Some(ref sp) = cls.source_path {
+                if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                    return Some(GotoTarget::SourceFile {
+                        path: sp.clone(),
+                        range: Range::default(),
+                    });
+                }
+            }
+
+            // External class (JDK or JAR library)
+            return Some(GotoTarget::External {
+                cls,
+                target_name: None,
+            });
         }
 
         // 3. Check if cursor is on a local symbol definition (method, field, etc.)
-        // If cursor is inside a specific class, prefer symbols belonging to that class
         let enclosing_class = self.ast.find_enclosing_class_at_position(line, character);
         let symbols = self.ast.extract_symbols();
 
         if let Some(enc) = &enclosing_class {
             for sym in &symbols {
                 if sym.name == ident_text && sym.container_name.as_ref() == Some(enc) {
-                    return Some((String::new(), sym.selection_range.clone()));
+                    return Some(GotoTarget::Local(sym.selection_range.clone()));
                 }
             }
         }
 
         for sym in &symbols {
             if sym.name == ident_text {
-                return Some((String::new(), sym.selection_range.clone()));
+                return Some(GotoTarget::Local(sym.selection_range.clone()));
             }
         }
 
@@ -347,13 +534,13 @@ impl<'a> SemanticContext<'a> {
             if let Some(enc) = &enclosing_class {
                 for sym in &symbols {
                     if sym.name == field_cand && sym.container_name.as_ref() == Some(enc) {
-                        return Some((String::new(), sym.selection_range.clone()));
+                        return Some(GotoTarget::Local(sym.selection_range.clone()));
                     }
                 }
             }
             for sym in &symbols {
                 if sym.name == field_cand {
-                    return Some((String::new(), sym.selection_range.clone()));
+                    return Some(GotoTarget::Local(sym.selection_range.clone()));
                 }
             }
         } else if ident_text.starts_with("is") && ident_text.len() > 2 {
@@ -361,18 +548,30 @@ impl<'a> SemanticContext<'a> {
             if let Some(enc) = &enclosing_class {
                 for sym in &symbols {
                     if sym.name == field_cand && sym.container_name.as_ref() == Some(enc) {
-                        return Some((String::new(), sym.selection_range.clone()));
+                        return Some(GotoTarget::Local(sym.selection_range.clone()));
                     }
                 }
             }
             for sym in &symbols {
                 if sym.name == field_cand {
-                    return Some((String::new(), sym.selection_range.clone()));
+                    return Some(GotoTarget::Local(sym.selection_range.clone()));
                 }
             }
         }
 
         None
+    }
+
+    /// Resolve definition at given cursor location
+    pub async fn goto_definition(&self, line: u32, character: u32) -> Option<(String, Range)> {
+        match self.resolve_goto_target(line, character).await? {
+            GotoTarget::Local(r) => Some((String::new(), r)),
+            GotoTarget::SourceFile { path, range } => Some((path, range)),
+            GotoTarget::External { cls, .. } => {
+                let p = cls.source_path.clone().unwrap_or_default();
+                Some((p, Range::default()))
+            }
+        }
     }
 
     /// Resolve type definition for a variable/field/expression at cursor location
@@ -427,6 +626,71 @@ impl<'a> SemanticContext<'a> {
         None
     }
 
+    pub async fn populate_member_completions(
+        &self,
+        target_cls: &ClassInfo,
+        type_arg: Option<&String>,
+        is_static_access: bool,
+        line: u32,
+        character: u32,
+        items: &mut Vec<CompletionItem>,
+    ) {
+        let current_enclosing = self.ast.find_enclosing_class_at_position(line, character);
+        let is_same_class = current_enclosing.as_deref() == Some(&target_cls.simple_name);
+        let current_pkg = self.ast.extract_package().unwrap_or_default();
+        let is_same_package = !target_cls.package_name.is_empty() && current_pkg == target_cls.package_name;
+
+        // 1. Inherited & local methods with access control visibility & static/instance filtering
+        let inherited_methods = self.get_all_methods_with_inheritance(target_cls).await;
+        for m in inherited_methods {
+            if m.is_constructor {
+                continue;
+            }
+            if is_static_access && !m.is_static {
+                continue;
+            }
+            if !is_static_access && m.is_static {
+                continue;
+            }
+            // Visibility check: private methods only visible in same class, package-private only in same package
+            if !is_same_class && !m.is_public && !is_same_package {
+                continue;
+            }
+            let mut ret_display = m.return_type.simple_name();
+            // Generics Materialization: if return type is generic placeholder (e.g. E, T, Object) and type argument is known
+            if let Some(arg) = type_arg {
+                if matches!(ret_display.as_str(), "E" | "T" | "K" | "V" | "R" | "Object") {
+                    ret_display = arg.clone();
+                }
+            }
+            let param_labels: Vec<String> = m.parameters.iter().map(|(p, t)| format!("{} {}", t.simple_name(), p)).collect();
+            items.push(CompletionItem {
+                label: m.name.clone(),
+                kind: CompletionKind::Method,
+                detail: Some(format!("({}) -> {}", param_labels.join(", "), ret_display)),
+            });
+        }
+
+        // 2. Inherited & local fields with access control visibility & static/instance filtering
+        let inherited_fields = self.get_all_fields_with_inheritance(target_cls).await;
+        for f in inherited_fields {
+            if is_static_access && !f.is_static {
+                continue;
+            }
+            if !is_static_access && f.is_static {
+                continue;
+            }
+            if !is_same_class && !f.is_public && !is_same_package {
+                continue;
+            }
+            items.push(CompletionItem {
+                label: f.name.clone(),
+                kind: CompletionKind::Field,
+                detail: Some(format!("{} : {}", f.field_type.simple_name(), f.name)),
+            });
+        }
+    }
+
     /// Provide code completion candidates
     pub async fn get_completions(&self, line: u32, character: u32) -> Vec<CompletionItem> {
         let mut items = Vec::new();
@@ -441,6 +705,7 @@ impl<'a> SemanticContext<'a> {
                     if let Some(target) = p.child_by_field_name("object") {
                         let target_name = self.ast.node_text(&target);
                         let mut target_type_opt = None;
+                        let mut is_static_access = false;
 
                         // 1. Search local variables & parameters (including Java 10+ var)
                         let local_vars = self.ast.extract_local_variables_at_position(line, character);
@@ -463,7 +728,13 @@ impl<'a> SemanticContext<'a> {
                             }
                         }
 
-                        // 3. Resolve target type methods with generics materialization
+                        // 3. Fallback to static class access (e.g. Math. or StringUtils.)
+                        if target_type_opt.is_none() {
+                            target_type_opt = Some(target_name.to_string());
+                            is_static_access = true;
+                        }
+
+                        // 4. Resolve target type methods with generics materialization
                         if let Some(ty_str) = target_type_opt {
                             // Extract base type and type argument, e.g. "List<String>" -> base="List", arg="String"
                             let (base_type, type_arg) = if let Some(idx) = ty_str.find('<') {
@@ -475,31 +746,65 @@ impl<'a> SemanticContext<'a> {
                             };
 
                             if let Some(target_cls) = self.resolve_type(base_type).await {
-                                let inherited_methods = self.get_all_methods_with_inheritance(&target_cls).await;
-                                for m in inherited_methods {
-                                    let mut ret_display = m.return_type.simple_name();
-                                    // Generics Materialization: if return type is generic placeholder (e.g. E, T, Object) and type argument is known
-                                    if let Some(arg) = &type_arg {
-                                        if matches!(ret_display.as_str(), "E" | "T" | "K" | "V" | "R" | "Object") {
-                                            ret_display = arg.clone();
-                                        }
-                                    }
-
-                                    let param_labels: Vec<String> = m.parameters.iter().map(|(p, t)| format!("{} {}", t.simple_name(), p)).collect();
-                                    items.push(CompletionItem {
-                                        label: m.name.clone(),
-                                        kind: CompletionKind::Method,
-                                        detail: Some(format!("({}) -> {}", param_labels.join(", "), ret_display)),
-                                    });
-                                }
+                                self.populate_member_completions(&target_cls, type_arg.as_ref(), is_static_access, line, character, &mut items).await;
                             }
                         }
                     }
                 }
         }
 
+        // Fault-tolerance: If user is typing right after a dot (e.g. `obj.`) but Tree-sitter AST collapsed into ERROR node
+        if items.is_empty() && self.ast.is_after_dot_access(line, character) {
+            if let Some(target_name) = self.ast.extract_receiver_before_dot_fallback(line, character) {
+                let mut target_type_opt = None;
+                let mut is_static_access = false;
+
+                // 1. Search local variables & parameters
+                let local_vars = self.ast.extract_local_variables_at_position(line, character);
+                for (v_name, v_type) in &local_vars {
+                    if v_name == &target_name {
+                        target_type_opt = Some(v_type.clone());
+                        break;
+                    }
+                }
+
+                // 2. Search local fields in classes
+                if target_type_opt.is_none() {
+                    for cls in self.local_classes.values() {
+                        for f in &cls.fields {
+                            if f.name == target_name {
+                                target_type_opt = Some(f.field_type.simple_name());
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Fallback to static class access
+                if target_type_opt.is_none() {
+                    target_type_opt = Some(target_name.clone());
+                    is_static_access = true;
+                }
+
+                // 4. Resolve target type methods & fields with generics materialization and visibility filtering
+                if let Some(ty_str) = target_type_opt {
+                    let (base_type, type_arg) = if let Some(idx) = ty_str.find('<') {
+                        let base = ty_str[..idx].trim();
+                        let arg = ty_str[idx + 1..].trim_end_matches('>').trim();
+                        (base, Some(arg.to_string()))
+                    } else {
+                        (ty_str.as_str(), None)
+                    };
+
+                    if let Some(target_cls) = self.resolve_type(base_type).await {
+                        self.populate_member_completions(&target_cls, type_arg.as_ref(), is_static_access, line, character, &mut items).await;
+                    }
+                }
+            }
+        }
+
         // If no dot member completion, suggest in-scope classes and keywords
-        if items.is_empty() {
+        if items.is_empty() && !self.ast.is_after_dot_access(line, character) {
             for cls in self.classpath.all_classes().await {
                 items.push(CompletionItem {
                     label: cls.simple_name.clone(),
@@ -625,6 +930,39 @@ mod tests {
             range_b.start.line, method_b.selection_range.start.line,
             "b.process() must jump to ClassB.process"
         );
+    }
+
+    #[tokio::test]
+    async fn test_static_vs_instance_member_completion_filtering() {
+        let code = r#"
+            public class MathUtil {
+                public static int max(int a, int b) { return a > b ? a : b; }
+                public void instanceHelper() {}
+            }
+
+            public class Caller {
+                public void test() {
+                    MathUtil.
+                    MathUtil u = new MathUtil();
+                    u.
+                }
+            }
+        "#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).expect("Parse code");
+        let cp = ClasspathRegistry::new();
+        let sem = SemanticContext::new(&ast, &cp).await;
+
+        // Line 8: 'MathUtil.' -> static access
+        let static_completions = sem.get_completions(8, 29).await;
+        let static_labels: Vec<String> = static_completions.iter().map(|c| c.label.clone()).collect();
+        assert!(static_labels.contains(&"max".to_string()), "MathUtil. should suggest static method max, got: {:?}", static_labels);
+        assert!(!static_labels.contains(&"instanceHelper".to_string()), "MathUtil. must NOT suggest instanceHelper");
+
+        // Line 10: 'u.' -> instance access
+        let instance_completions = sem.get_completions(10, 22).await;
+        let instance_labels: Vec<String> = instance_completions.iter().map(|c| c.label.clone()).collect();
+        assert!(instance_labels.contains(&"instanceHelper".to_string()), "u. should suggest instanceHelper, got: {:?}", instance_labels);
+        assert!(!instance_labels.contains(&"max".to_string()), "u. should not suggest static method max");
     }
 }
 

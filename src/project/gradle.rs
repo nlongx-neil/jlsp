@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -14,6 +15,21 @@ pub struct GradleProject {
     pub dependencies: Vec<GradleDependency>,
 }
 
+const GRADLE_CONFIG_PREFIXES: &[&str] = &[
+    "implementation",
+    "testImplementation",
+    "api",
+    "testApi",
+    "compileOnly",
+    "testCompileOnly",
+    "runtimeOnly",
+    "testRuntimeOnly",
+    "annotationProcessor",
+    "kapt",
+    "compile",
+    "testCompile",
+];
+
 impl GradleProject {
     pub fn parse<P: AsRef<Path>>(gradle_path: P) -> Result<Self, String> {
         let content = fs::read_to_string(&gradle_path)
@@ -21,30 +37,142 @@ impl GradleProject {
 
         let mut dependencies = Vec::new();
 
-        // Regex-free robust parser for:
-        // implementation 'group:artifact:version'
-        // implementation("group:artifact:version")
-        // api 'group:artifact:version'
+        // 1. Check for Gradle Version Catalog (gradle/libs.versions.toml)
+        let catalog_libs = if let Some(parent) = gradle_path.as_ref().parent() {
+            let direct_catalog = parent.join("gradle").join("libs.versions.toml");
+            let root_catalog = parent.parent().map(|p| p.join("gradle").join("libs.versions.toml"));
+            let catalog_path = if direct_catalog.exists() {
+                Some(direct_catalog)
+            } else if let Some(rc) = root_catalog {
+                if rc.exists() { Some(rc) } else { None }
+            } else {
+                None
+            };
+
+            if let Some(cp) = catalog_path {
+                if let Ok(toml_str) = fs::read_to_string(&cp) {
+                    Self::parse_version_catalog(&toml_str)
+                } else {
+                    HashMap::new()
+                }
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+
+        // 2. Parse dependencies in build.gradle / build.gradle.kts
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
                 continue;
             }
 
-            for prefix in &["implementation", "api", "compileOnly", "runtimeOnly"] {
+            for prefix in GRADLE_CONFIG_PREFIXES {
                 if let Some(rest) = trimmed.strip_prefix(prefix) {
                     let rest = rest.trim_start();
-                    let cleaned = rest
+                    // Case A: Version catalog reference, e.g. implementation(libs.junit.jupiter) or testImplementation libs.junit_jupiter
+                    if let Some(libs_idx) = rest.find("libs.") {
+                        let after_libs = &rest[libs_idx + 5..];
+                        let alias = after_libs
+                            .trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-')
+                            .replace(['-', '_'], ".");
+                        if let Some(dep) = catalog_libs.get(&alias) {
+                            if !dependencies.contains(dep) {
+                                dependencies.push(dep.clone());
+                            }
+                            break;
+                        }
+                    }
+
+                    // Case B: Groovy / Kotlin Map syntax:
+                    // implementation group: 'org.slf4j', name: 'slf4j-api', version: '2.0.7'
+                    // implementation(group = "org.slf4j", name = "slf4j-api", version = "2.0.7")
+                    if (rest.contains("group") && rest.contains("name")) || (rest.contains("group:") && rest.contains("name:")) {
+                        let mut group = String::new();
+                        let mut name = String::new();
+                        let mut version = String::new();
+                        for part in rest.split(',') {
+                            let part = part.trim();
+                            for delim in &[':', '='] {
+                                if let Some((k, v)) = part.split_once(*delim) {
+                                    let k_clean = k.trim().trim_matches(|c: char| !c.is_alphabetic());
+                                    let v_clean = v.trim().trim_matches(|c: char| c == '\'' || c == '"' || c == '(' || c == ')' || c == ' ');
+                                    if k_clean == "group" {
+                                        group = v_clean.to_string();
+                                    } else if k_clean == "name" {
+                                        name = v_clean.to_string();
+                                    } else if k_clean == "version" {
+                                        version = v_clean.to_string();
+                                    }
+                                }
+                            }
+                        }
+                        if !group.is_empty() && !name.is_empty() {
+                            let dep = GradleDependency {
+                                group_id: group,
+                                artifact_id: name,
+                                version,
+                            };
+                            if !dependencies.contains(&dep) {
+                                dependencies.push(dep);
+                            }
+                            break;
+                        }
+                    }
+
+                    // Case C: Standard string notation & Kotlin DSL functions:
+                    // implementation 'group:artifact:version'
+                    // testImplementation("group:artifact:version")
+                    // implementation(platform("group:artifact:version"))
+                    // implementation(kotlin("stdlib", "1.9.0"))
+                    let mut cleaned_rest = rest;
+                    if let Some(p_idx) = cleaned_rest.find("platform(") {
+                        cleaned_rest = &cleaned_rest[p_idx + 9..];
+                    } else if let Some(ep_idx) = cleaned_rest.find("enforcedPlatform(") {
+                        cleaned_rest = &cleaned_rest[ep_idx + 17..];
+                    }
+                    if let Some(k_idx) = cleaned_rest.find("kotlin(") {
+                        let after_k = &cleaned_rest[k_idx + 7..];
+                        let k_cleaned = after_k.trim_matches(|c| c == '(' || c == ')' || c == '\'' || c == '"' || c == ',' || c == ' ');
+                        let k_parts: Vec<&str> = k_cleaned.split(|c| c == ',' || c == '"' || c == '\'').filter(|s| !s.trim().is_empty()).collect();
+                        if let Some(module) = k_parts.first() {
+                            let dep = GradleDependency {
+                                group_id: "org.jetbrains.kotlin".to_string(),
+                                artifact_id: format!("kotlin-{}", module.trim()),
+                                version: k_parts.get(1).map(|v| v.trim().to_string()).unwrap_or_default(),
+                            };
+                            if !dependencies.contains(&dep) {
+                                dependencies.push(dep);
+                            }
+                            break;
+                        }
+                    }
+
+                    let cleaned = cleaned_rest
                         .trim_matches(|c| c == '(' || c == ')' || c == '\'' || c == '"' || c == ',' || c == ' ');
                     let parts: Vec<&str> = cleaned.split(':').collect();
-                    if parts.len() == 3 {
-                        dependencies.push(GradleDependency {
+                    if parts.len() >= 2 {
+                        let ver = if parts.len() >= 3 { parts[2].trim().to_string() } else { String::new() };
+                        let dep = GradleDependency {
                             group_id: parts[0].trim().to_string(),
                             artifact_id: parts[1].trim().to_string(),
-                            version: parts[2].trim().to_string(),
-                        });
+                            version: ver,
+                        };
+                        if !dependencies.contains(&dep) {
+                            dependencies.push(dep);
+                        }
+                        break;
                     }
                 }
+            }
+        }
+
+        // If version catalog was present, include all defined libraries so they are accessible
+        for (_, dep) in catalog_libs {
+            if !dependencies.contains(&dep) {
+                dependencies.push(dep);
             }
         }
 
@@ -52,6 +180,92 @@ impl GradleProject {
             gradle_file: gradle_path.as_ref().to_path_buf(),
             dependencies,
         })
+    }
+
+    /// Parse Gradle Version Catalog TOML format (gradle/libs.versions.toml)
+    pub fn parse_version_catalog(toml_content: &str) -> HashMap<String, GradleDependency> {
+        let mut versions: HashMap<String, String> = HashMap::new();
+        let mut libraries: HashMap<String, GradleDependency> = HashMap::new();
+        let mut current_section = "";
+
+        for line in toml_content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                current_section = trimmed[1..trimmed.len() - 1].trim();
+                continue;
+            }
+
+            if current_section == "versions" {
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    let key = k.trim().trim_matches('"').trim_matches('\'').replace('-', "_");
+                    let val = v.trim().trim_matches('"').trim_matches('\'').trim();
+                    versions.insert(key, val.to_string());
+                }
+            } else if current_section == "libraries" {
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    let alias = k.trim().trim_matches('"').trim_matches('\'').trim().replace(['-', '_'], ".");
+                    let val = v.trim();
+                    // Pattern 1: alias = "group:artifact:version"
+                    if val.starts_with('"') || val.starts_with('\'') {
+                        let cleaned = val.trim_matches('"').trim_matches('\'');
+                        let parts: Vec<&str> = cleaned.split(':').collect();
+                        if parts.len() >= 2 {
+                            let ver = if parts.len() >= 3 { parts[2] } else { "" };
+                            libraries.insert(alias.clone(), GradleDependency {
+                                group_id: parts[0].to_string(),
+                                artifact_id: parts[1].to_string(),
+                                version: ver.to_string(),
+                            });
+                        }
+                    } else if val.starts_with('{') && val.ends_with('}') {
+                        // Pattern 2: table inline: { module = "...", version.ref = "..." } or { group = "...", name = "...", version = "..." }
+                        let inner = &val[1..val.len() - 1];
+                        let mut group = String::new();
+                        let mut artifact = String::new();
+                        let mut version = String::new();
+
+                        for pair in inner.split(',') {
+                            if let Some((pk, pv)) = pair.split_once('=') {
+                                let pkey = pk.trim().replace('-', ".");
+                                let pval = pv.trim().trim_matches('"').trim_matches('\'').trim();
+                                if pkey == "module" {
+                                    if let Some((g, a)) = pval.split_once(':') {
+                                        group = g.to_string();
+                                        artifact = a.to_string();
+                                    }
+                                } else if pkey == "group" {
+                                    group = pval.to_string();
+                                } else if pkey == "name" {
+                                    artifact = pval.to_string();
+                                } else if pkey == "version" {
+                                    version = pval.to_string();
+                                } else if pkey == "version.ref" {
+                                    let ref_key = pval.replace('-', "_");
+                                    if let Some(v) = versions.get(&ref_key) {
+                                        version = v.clone();
+                                    } else {
+                                        version = pval.to_string();
+                                    }
+                                }
+                            }
+                        }
+
+                        if !group.is_empty() && !artifact.is_empty() {
+                            libraries.insert(alias.clone(), GradleDependency {
+                                group_id: group,
+                                artifact_id: artifact,
+                                version,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        libraries
     }
 
     /// Resolve jar files from Gradle local cache (~/.gradle/caches/modules-2/files-2.1/)
@@ -197,6 +411,73 @@ mod tests {
         assert_eq!(project.dependencies[0].version, "3.2.0");
         assert_eq!(project.dependencies[1].group_id, "com.google.guava");
         assert_eq!(project.dependencies[2].artifact_id, "lombok");
+        let _ = fs::remove_file(tmp_file);
+    }
+
+    #[test]
+    fn test_parse_gradle_version_catalog_and_map_syntax() {
+        let toml_sample = r#"
+            [versions]
+            junit = "5.9.2"
+            slf4j = "2.0.7"
+
+            [libraries]
+            junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+            slf4j-api = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+            guava = "com.google.guava:guava:32.1.2-jre"
+        "#;
+
+        let catalog_map = GradleProject::parse_version_catalog(toml_sample);
+        assert_eq!(catalog_map.len(), 3);
+        assert_eq!(catalog_map["junit.jupiter"].version, "5.9.2");
+        assert_eq!(catalog_map["slf4j.api"].artifact_id, "slf4j-api");
+        assert_eq!(catalog_map["slf4j.api"].version, "2.0.7");
+        assert_eq!(catalog_map["guava"].artifact_id, "guava");
+
+        let gradle_sample = r#"
+            dependencies {
+                testImplementation(libs.junit.jupiter)
+                implementation group: 'org.slf4j', name: 'slf4j-api', version: '2.0.7'
+                testImplementation 'org.assertj:assertj-core:3.24.2'
+            }
+        "#;
+
+        let temp_dir = std::env::temp_dir().join("gradle_test_proj");
+        let gradle_dir = temp_dir.join("gradle");
+        let _ = fs::create_dir_all(&gradle_dir);
+        let catalog_file = gradle_dir.join("libs.versions.toml");
+        let build_file = temp_dir.join("build.gradle");
+
+        fs::write(&catalog_file, toml_sample).unwrap();
+        fs::write(&build_file, gradle_sample).unwrap();
+
+        let project = GradleProject::parse(&build_file).unwrap();
+        assert!(project.dependencies.iter().any(|d| d.artifact_id == "junit-jupiter" && d.version == "5.9.2"));
+        assert!(project.dependencies.iter().any(|d| d.artifact_id == "slf4j-api" && d.version == "2.0.7"));
+        assert!(project.dependencies.iter().any(|d| d.artifact_id == "assertj-core" && d.version == "3.24.2"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_gradle_kotlin_dsl_and_platform_parsing() {
+        let kts_sample = r#"
+            dependencies {
+                implementation("org.springframework.boot:spring-boot-starter-web:3.2.0")
+                implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))
+                implementation(kotlin("stdlib", "1.9.22"))
+                testImplementation("org.junit.jupiter:junit-jupiter:5.10.0")
+            }
+        "#;
+        let tmp_file = std::env::temp_dir().join(format!("build.gradle_{}.kts", std::process::id()));
+        fs::write(&tmp_file, kts_sample).unwrap();
+
+        let project = GradleProject::parse(&tmp_file).unwrap();
+        assert!(project.dependencies.iter().any(|d| d.artifact_id == "spring-boot-starter-web" && d.version == "3.2.0"));
+        assert!(project.dependencies.iter().any(|d| d.artifact_id == "spring-boot-dependencies" && d.version == "3.2.0"));
+        assert!(project.dependencies.iter().any(|d| d.group_id == "org.jetbrains.kotlin" && d.artifact_id == "kotlin-stdlib" && d.version == "1.9.22"));
+        assert!(project.dependencies.iter().any(|d| d.artifact_id == "junit-jupiter" && d.version == "5.10.0"));
+
         let _ = fs::remove_file(tmp_file);
     }
 }

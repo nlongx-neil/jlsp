@@ -60,6 +60,9 @@ impl JavaFormatter {
             "\t".to_string()
         };
 
+        let mut in_block_comment = false;
+        let mut in_text_block = false;
+
         for raw_line in source.lines() {
             let line = raw_line.trim();
 
@@ -70,38 +73,116 @@ impl JavaFormatter {
 
             // Count leading closing braces that reduce this line's indent
             let mut leading_close = 0;
-            for ch in line.chars() {
-                if ch == '}' {
-                    leading_close += 1;
-                } else if !ch.is_whitespace() {
-                    break;
+            if !in_block_comment && !in_text_block {
+                for ch in line.chars() {
+                    if ch == '}' {
+                        leading_close += 1;
+                    } else if !ch.is_whitespace() {
+                        break;
+                    }
                 }
             }
 
             let effective_indent = indent_level.saturating_sub(leading_close);
-            for _ in 0..effective_indent {
-                result.push_str(&indent_unit);
+            if in_block_comment && line.starts_with('*') && !line.starts_with("*/") {
+                for _ in 0..effective_indent {
+                    result.push_str(&indent_unit);
+                }
+                result.push(' ');
+                result.push_str(line);
+                result.push('\n');
+            } else {
+                for _ in 0..effective_indent {
+                    result.push_str(&indent_unit);
+                }
+                result.push_str(line);
+                result.push('\n');
             }
-            result.push_str(line);
-            result.push('\n');
 
-            // Count net brace change on this line
+            // Lexical scan of the line to compute net brace change
+            let chars: Vec<char> = line.chars().collect();
+            let mut i = 0;
             let mut opens = 0;
             let mut closes = 0;
-            let mut in_string = false;
-            let mut prev_char = ' ';
 
-            for ch in line.chars() {
-                if ch == '"' && prev_char != '\\' {
-                    in_string = !in_string;
-                } else if !in_string {
-                    if ch == '{' {
-                        opens += 1;
-                    } else if ch == '}' {
-                        closes += 1;
+            while i < chars.len() {
+                if in_block_comment {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        in_block_comment = false;
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
+                    continue;
                 }
-                prev_char = ch;
+
+                if in_text_block {
+                    if chars[i] == '"' && chars.get(i + 1) == Some(&'"') && chars.get(i + 2) == Some(&'"') {
+                        in_text_block = false;
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                // Check text block start: """
+                if chars[i] == '"' && chars.get(i + 1) == Some(&'"') && chars.get(i + 2) == Some(&'"') {
+                    in_text_block = true;
+                    i += 3;
+                    continue;
+                }
+
+                // Check single line comment: //
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+                    break;
+                }
+
+                // Check block comment start: /*
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+
+                // Check string literal: "..."
+                if chars[i] == '"' {
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '\\' {
+                            i += 2;
+                        } else if chars[i] == '"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                // Check character literal: '...'
+                if chars[i] == '\'' {
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '\\' {
+                            i += 2;
+                        } else if chars[i] == '\'' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                if chars[i] == '{' {
+                    opens += 1;
+                } else if chars[i] == '}' {
+                    closes += 1;
+                }
+                i += 1;
             }
 
             if opens > closes {
@@ -138,6 +219,42 @@ mod tests {
         let formatter = JavaFormatter::new(4, true);
         let formatted = formatter.format(unformatted);
         let expected = "public class Foo {\n    public void bar() {\n        System.out.println(1);\n    }\n}\n";
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn test_format_with_char_literals_comments_and_text_blocks() {
+        let unformatted = r#"public class EdgeCases {
+public void test() {
+char c1 = '}';
+char c2 = '{';
+// single comment {
+/*
+block comment {
+*/
+String text = """
+SELECT {id} FROM table
+""";
+int x = 42;
+}
+}"#;
+        let formatter = JavaFormatter::new(4, true);
+        let formatted = formatter.format(unformatted);
+        let expected = r#"public class EdgeCases {
+    public void test() {
+        char c1 = '}';
+        char c2 = '{';
+        // single comment {
+        /*
+        block comment {
+        */
+        String text = """
+        SELECT {id} FROM table
+        """;
+        int x = 42;
+    }
+}
+"#;
         assert_eq!(formatted, expected);
     }
 }
