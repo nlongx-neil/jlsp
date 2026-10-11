@@ -117,7 +117,7 @@ for spec in "${TARGET_SPECS[@]}"; do
   if [ ${#SELECTED_TARGETS[@]} -gt 0 ]; then
     MATCH=false
     for st in "${SELECTED_TARGETS[@]}"; do
-      if [[ "$st" == "$target" || "$st" == "$os_name" || "$st" == "$arch_name" || "$st" == "$out_bin_name" ]]; then
+      if [[ "$st" == "$target" || "$st" == "$os_name" || "$st" == "$arch_name" || "$st" == "$out_bin_name" || ("$st" == "arm64-apple-darwin" && "$target" == "aarch64-apple-darwin") ]]; then
         MATCH=true
         break
       fi

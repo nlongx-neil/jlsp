@@ -1091,7 +1091,8 @@ pub fn extract_source_from_jdk(jdk_home_opt: Option<&Path>, fqn: &str) -> Option
         }
     }
 
-    let rel_path = format!("{}.java", fqn.replace('.', "/"));
+    let clean_fqn = fqn.split('$').next().unwrap_or(fqn);
+    let rel_path = format!("{}.java", clean_fqn.replace('.', "/"));
     let java_base_path = format!("java.base/{}", rel_path);
 
     for src_zip in candidate_src_zips {

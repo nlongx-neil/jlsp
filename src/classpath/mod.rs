@@ -65,9 +65,16 @@ impl ClasspathRegistry {
         if let Some(cls) = classes.get(fqn) {
             return Some(cls.clone());
         }
+        drop(classes);
+
         if let Some(builtin) = get_builtin_framework_class(fqn) {
             return Some(Arc::new(builtin));
         }
+
+        if let Some(jdk_cls) = get_builtin_jdk_class(fqn) {
+            return Some(Arc::new(jdk_cls));
+        }
+
         None
     }
 
@@ -82,6 +89,11 @@ impl ClasspathRegistry {
         if res.is_empty() {
             if let Some(builtin) = get_builtin_framework_class_by_simple_name(simple_name) {
                 res.push(Arc::new(builtin));
+            }
+        }
+        if res.is_empty() {
+            if let Some(jdk_cls) = get_builtin_jdk_class_by_simple_name(simple_name) {
+                res.push(Arc::new(jdk_cls));
             }
         }
         res
@@ -401,114 +413,318 @@ pub fn find_java_home() -> Option<std::path::PathBuf> {
 /// Returns true if the import belongs to standard JDK core packages
 pub fn is_standard_jdk_package(imp: &str) -> bool {
     const STANDARD_PREFIXES: &[&str] = &[
-        "java.lang.",
-        "java.util.",
-        "java.io.",
-        "java.nio.",
-        "java.net.",
-        "java.time.",
-        "java.math.",
-        "java.text.",
-        "java.security.",
-        "java.sql.",
-        "java.rmi.",
-        "java.awt.",
-        "java.beans.",
-        "javax.annotation.",
-        "javax.crypto.",
-        "javax.net.",
-        "javax.security.",
-        "javax.sound.",
-        "javax.sql.",
-        "javax.swing.",
-        "javax.xml.",
-        "javax.naming.",
-        "javax.management.",
-        "javax.transaction.",
+        "java.",
+        "javax.",
+        "jdk.",
+        "sun.",
+        "com.sun.",
     ];
     STANDARD_PREFIXES.iter().any(|prefix| imp.starts_with(prefix))
 }
 
 /// Returns true if the type is a known core JDK class
 pub fn is_known_core_jdk_class(imp: &str) -> bool {
+    is_standard_jdk_package(imp)
+}
+
+pub fn is_standard_java_lang_class(name: &str) -> bool {
     matches!(
-        imp,
-        "java.io.File"
-            | "java.io.InputStream"
-            | "java.io.OutputStream"
-            | "java.io.FileInputStream"
-            | "java.io.FileOutputStream"
-            | "java.io.Reader"
-            | "java.io.Writer"
-            | "java.io.BufferedReader"
-            | "java.io.BufferedWriter"
-            | "java.io.InputStreamReader"
-            | "java.io.OutputStreamWriter"
-            | "java.io.IOException"
-            | "java.io.Serializable"
-            | "java.io.Closeable"
-            | "java.io.Flushable"
-            | "java.io.ByteArrayInputStream"
-            | "java.io.ByteArrayOutputStream"
-            | "java.io.PrintStream"
-            | "java.io.PrintWriter"
-            | "java.util.ArrayList"
-            | "java.util.LinkedList"
-            | "java.util.List"
-            | "java.util.Set"
-            | "java.util.HashSet"
-            | "java.util.LinkedHashSet"
-            | "java.util.TreeSet"
-            | "java.util.Map"
-            | "java.util.HashMap"
-            | "java.util.LinkedHashMap"
-            | "java.util.TreeMap"
-            | "java.util.Collection"
-            | "java.util.Collections"
-            | "java.util.Arrays"
-            | "java.util.Objects"
-            | "java.util.Optional"
-            | "java.util.Queue"
-            | "java.util.Deque"
-            | "java.util.ArrayDeque"
-            | "java.util.PriorityQueue"
-            | "java.util.Iterator"
-            | "java.util.UUID"
-            | "java.util.Date"
-            | "java.util.Calendar"
-            | "java.util.Comparator"
-            | "java.util.Random"
-            | "java.util.Scanner"
-            | "java.util.StringTokenizer"
-            | "java.util.concurrent.ConcurrentHashMap"
-            | "java.util.concurrent.CopyOnWriteArrayList"
-            | "java.util.concurrent.ExecutorService"
-            | "java.util.concurrent.Executors"
-            | "java.util.concurrent.Future"
-            | "java.util.concurrent.CompletableFuture"
-            | "java.util.stream.Stream"
-            | "java.util.stream.Collectors"
-            | "java.util.function.Function"
-            | "java.util.function.Consumer"
-            | "java.util.function.Supplier"
-            | "java.util.function.Predicate"
-            | "java.util.function.BiFunction"
-            | "java.util.function.BiConsumer"
-            | "java.util.function.BiPredicate"
-            | "java.net.URI"
-            | "java.net.URL"
-            | "java.nio.file.Path"
-            | "java.nio.file.Paths"
-            | "java.nio.file.Files"
-            | "java.time.LocalDate"
-            | "java.time.LocalTime"
-            | "java.time.LocalDateTime"
-            | "java.time.Instant"
-            | "java.time.Duration"
-            | "java.time.Period"
-            | "java.math.BigDecimal"
-            | "java.math.BigInteger"
+        name,
+        "String"
+            | "Object"
+            | "Class"
+            | "System"
+            | "Math"
+            | "Thread"
+            | "Runnable"
+            | "Throwable"
+            | "Exception"
+            | "RuntimeException"
+            | "Error"
+            | "Void"
+            | "Boolean"
+            | "Byte"
+            | "Character"
+            | "Short"
+            | "Integer"
+            | "Long"
+            | "Float"
+            | "Double"
+            | "Number"
+            | "CharSequence"
+            | "StringBuilder"
+            | "StringBuffer"
+            | "Cloneable"
+            | "Comparable"
+            | "Iterable"
+            | "AutoCloseable"
+            | "Readable"
+            | "Appendable"
+            | "ThreadLocal"
+            | "InheritableThreadLocal"
+            | "ThreadGroup"
+            | "Package"
+            | "Module"
+            | "ClassLoader"
+            | "StackTraceElement"
+            | "Process"
+            | "ProcessBuilder"
+            | "Enum"
+            | "Record"
+            | "Deprecated"
+            | "Override"
+            | "SuppressWarnings"
+            | "SafeVarargs"
+            | "FunctionalInterface"
+            | "AssertionError"
+            | "NullPointerException"
+            | "IllegalArgumentException"
+            | "IllegalStateException"
+            | "IndexOutOfBoundsException"
+            | "ArrayIndexOutOfBoundsException"
+            | "StringIndexOutOfBoundsException"
+            | "UnsupportedOperationException"
+            | "NoSuchMethodException"
+            | "NoSuchFieldException"
+            | "ClassNotFoundException"
+            | "InterruptedException"
     )
+}
+
+/// Return full qualified name(s) of standard JDK classes matching a simple name
+pub fn find_common_jdk_classes_by_name(name: &str) -> Vec<String> {
+    match name {
+        "List" => vec!["java.util.List".to_string(), "java.awt.List".to_string()],
+        "Map" => vec!["java.util.Map".to_string()],
+        "Set" => vec!["java.util.Set".to_string()],
+        "Queue" => vec!["java.util.Queue".to_string()],
+        "Deque" => vec!["java.util.Deque".to_string()],
+        "ArrayList" => vec!["java.util.ArrayList".to_string()],
+        "LinkedList" => vec!["java.util.LinkedList".to_string()],
+        "HashMap" => vec!["java.util.HashMap".to_string()],
+        "HashSet" => vec!["java.util.HashSet".to_string()],
+        "LinkedHashMap" => vec!["java.util.LinkedHashMap".to_string()],
+        "LinkedHashSet" => vec!["java.util.LinkedHashSet".to_string()],
+        "TreeMap" => vec!["java.util.TreeMap".to_string()],
+        "TreeSet" => vec!["java.util.TreeSet".to_string()],
+        "Arrays" => vec!["java.util.Arrays".to_string()],
+        "Collections" => vec!["java.util.Collections".to_string()],
+        "Optional" => vec!["java.util.Optional".to_string()],
+        "Objects" => vec!["java.util.Objects".to_string()],
+        "UUID" => vec!["java.util.UUID".to_string()],
+        "Date" => vec!["java.util.Date".to_string(), "java.sql.Date".to_string()],
+        "Pattern" => vec!["java.util.regex.Pattern".to_string()],
+        "Matcher" => vec!["java.util.regex.Matcher".to_string()],
+        "File" => vec!["java.io.File".to_string()],
+        "Path" => vec!["java.nio.file.Path".to_string()],
+        "Paths" => vec!["java.nio.file.Paths".to_string()],
+        "Files" => vec!["java.nio.file.Files".to_string()],
+        "InputStream" => vec!["java.io.InputStream".to_string()],
+        "OutputStream" => vec!["java.io.OutputStream".to_string()],
+        "FileInputStream" => vec!["java.io.FileInputStream".to_string()],
+        "FileOutputStream" => vec!["java.io.FileOutputStream".to_string()],
+        "BufferedReader" => vec!["java.io.BufferedReader".to_string()],
+        "BufferedWriter" => vec!["java.io.BufferedWriter".to_string()],
+        "InputStreamReader" => vec!["java.io.InputStreamReader".to_string()],
+        "OutputStreamWriter" => vec!["java.io.OutputStreamWriter".to_string()],
+        "IOException" => vec!["java.io.IOException".to_string()],
+        "SQLException" => vec!["java.sql.SQLException".to_string()],
+        "CompletableFuture" => vec!["java.util.concurrent.CompletableFuture".to_string()],
+        "ConcurrentHashMap" => vec!["java.util.concurrent.ConcurrentHashMap".to_string()],
+        "CountDownLatch" => vec!["java.util.concurrent.CountDownLatch".to_string()],
+        "ExecutorService" => vec!["java.util.concurrent.ExecutorService".to_string()],
+        "Executors" => vec!["java.util.concurrent.Executors".to_string()],
+        "TimeUnit" => vec!["java.util.concurrent.TimeUnit".to_string()],
+        "BigDecimal" => vec!["java.math.BigDecimal".to_string()],
+        "BigInteger" => vec!["java.math.BigInteger".to_string()],
+        "Duration" => vec!["java.time.Duration".to_string()],
+        "Instant" => vec!["java.time.Instant".to_string()],
+        "LocalDate" => vec!["java.time.LocalDate".to_string()],
+        "LocalDateTime" => vec!["java.time.LocalDateTime".to_string()],
+        "LocalTime" => vec!["java.time.LocalTime".to_string()],
+        "ZonedDateTime" => vec!["java.time.ZonedDateTime".to_string()],
+        "Stream" => vec!["java.util.stream.Stream".to_string()],
+        "Collectors" => vec!["java.util.stream.Collectors".to_string()],
+        "Consumer" => vec!["java.util.function.Consumer".to_string()],
+        "Function" => vec!["java.util.function.Function".to_string()],
+        "Predicate" => vec!["java.util.function.Predicate".to_string()],
+        "Supplier" => vec!["java.util.function.Supplier".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// Retrieve or synthesize a built-in ClassInfo for standard JDK classes
+pub fn get_builtin_jdk_class(fqn: &str) -> Option<ClassInfo> {
+    if !is_standard_jdk_package(fqn) {
+        return None;
+    }
+
+    let simple_name = fqn.rsplit('.').next().unwrap_or(fqn).to_string();
+    if simple_name.is_empty() || !simple_name.chars().next().unwrap_or(' ').is_uppercase() || simple_name.contains('_') {
+        return None;
+    }
+
+    let package_name = if let Some(idx) = fqn.rfind('.') {
+        fqn[..idx].to_string()
+    } else {
+        String::new()
+    };
+
+    if package_name == "java.lang" && !is_standard_java_lang_class(&simple_name) {
+        return None;
+    }
+
+    let is_interface = matches!(
+        simple_name.as_str(),
+        "List"
+            | "Set"
+            | "Map"
+            | "Collection"
+            | "Queue"
+            | "Deque"
+            | "Iterable"
+            | "Iterator"
+            | "Comparable"
+            | "Cloneable"
+            | "Serializable"
+            | "Closeable"
+            | "AutoCloseable"
+            | "Runnable"
+            | "Callable"
+            | "Future"
+            | "Lock"
+            | "ReadWriteLock"
+            | "Condition"
+            | "BlockingQueue"
+            | "Executor"
+            | "ExecutorService"
+            | "ScheduledExecutorService"
+            | "Stream"
+            | "Consumer"
+            | "Supplier"
+            | "Function"
+            | "Predicate"
+            | "BiConsumer"
+            | "BiFunction"
+            | "BiPredicate"
+    );
+
+    let kind = if is_interface {
+        ClassKind::Interface
+    } else {
+        ClassKind::Class
+    };
+
+    Some(ClassInfo {
+        fqn: fqn.to_string(),
+        simple_name,
+        package_name,
+        kind,
+        super_class: Some("java.lang.Object".to_string()),
+        interfaces: vec![],
+        methods: vec![],
+        fields: vec![],
+        source_path: None,
+        is_public: true,
+    })
+}
+
+/// Fallback lookup by simple name for popular JDK standard classes
+pub fn get_builtin_jdk_class_by_simple_name(simple_name: &str) -> Option<ClassInfo> {
+    let fqn = match simple_name {
+        "String" => "java.lang.String",
+        "Object" => "java.lang.Object",
+        "Class" => "java.lang.Class",
+        "Integer" => "java.lang.Integer",
+        "Long" => "java.lang.Long",
+        "Boolean" => "java.lang.Boolean",
+        "Double" => "java.lang.Double",
+        "Float" => "java.lang.Float",
+        "Byte" => "java.lang.Byte",
+        "Short" => "java.lang.Short",
+        "Character" => "java.lang.Character",
+        "CharSequence" => "java.lang.CharSequence",
+        "StringBuilder" => "java.lang.StringBuilder",
+        "StringBuffer" => "java.lang.StringBuffer",
+        "Thread" => "java.lang.Thread",
+        "Runnable" => "java.lang.Runnable",
+        "Throwable" => "java.lang.Throwable",
+        "Exception" => "java.lang.Exception",
+        "RuntimeException" => "java.lang.RuntimeException",
+        "System" => "java.lang.System",
+        "Math" => "java.lang.Math",
+        "CountDownLatch" => "java.util.concurrent.CountDownLatch",
+        "AtomicBoolean" => "java.util.concurrent.atomic.AtomicBoolean",
+        "AtomicInteger" => "java.util.concurrent.atomic.AtomicInteger",
+        "AtomicLong" => "java.util.concurrent.atomic.AtomicLong",
+        "AtomicReference" => "java.util.concurrent.atomic.AtomicReference",
+        "ConcurrentHashMap" => "java.util.concurrent.ConcurrentHashMap",
+        "CopyOnWriteArrayList" => "java.util.concurrent.CopyOnWriteArrayList",
+        "CopyOnWriteArraySet" => "java.util.concurrent.CopyOnWriteArraySet",
+        "BlockingQueue" => "java.util.concurrent.BlockingQueue",
+        "ArrayBlockingQueue" => "java.util.concurrent.ArrayBlockingQueue",
+        "LinkedBlockingQueue" => "java.util.concurrent.LinkedBlockingQueue",
+        "ConcurrentLinkedQueue" => "java.util.concurrent.ConcurrentLinkedQueue",
+        "ConcurrentLinkedDeque" => "java.util.concurrent.ConcurrentLinkedDeque",
+        "ExecutorService" => "java.util.concurrent.ExecutorService",
+        "ThreadPoolExecutor" => "java.util.concurrent.ThreadPoolExecutor",
+        "ScheduledExecutorService" => "java.util.concurrent.ScheduledExecutorService",
+        "Executors" => "java.util.concurrent.Executors",
+        "Future" => "java.util.concurrent.Future",
+        "CompletableFuture" => "java.util.concurrent.CompletableFuture",
+        "Callable" => "java.util.concurrent.Callable",
+        "Semaphore" => "java.util.concurrent.Semaphore",
+        "CyclicBarrier" => "java.util.concurrent.CyclicBarrier",
+        "ReentrantLock" => "java.util.concurrent.locks.ReentrantLock",
+        "ReentrantReadWriteLock" => "java.util.concurrent.locks.ReentrantReadWriteLock",
+        "Lock" => "java.util.concurrent.locks.Lock",
+        "ReadWriteLock" => "java.util.concurrent.locks.ReadWriteLock",
+        "Condition" => "java.util.concurrent.locks.Condition",
+        "File" => "java.io.File",
+        "InputStream" => "java.io.InputStream",
+        "OutputStream" => "java.io.OutputStream",
+        "FileInputStream" => "java.io.FileInputStream",
+        "FileOutputStream" => "java.io.FileOutputStream",
+        "BufferedReader" => "java.io.BufferedReader",
+        "BufferedWriter" => "java.io.BufferedWriter",
+        "List" => "java.util.List",
+        "ArrayList" => "java.util.ArrayList",
+        "LinkedList" => "java.util.LinkedList",
+        "Map" => "java.util.Map",
+        "HashMap" => "java.util.HashMap",
+        "Set" => "java.util.Set",
+        "HashSet" => "java.util.HashSet",
+        "Collection" => "java.util.Collection",
+        "Collections" => "java.util.Collections",
+        "Arrays" => "java.util.Arrays",
+        "Objects" => "java.util.Objects",
+        "Optional" => "java.util.Optional",
+        "Stream" => "java.util.stream.Stream",
+        "Collectors" => "java.util.stream.Collectors",
+        "Function" => "java.util.function.Function",
+        "Consumer" => "java.util.function.Consumer",
+        "Supplier" => "java.util.function.Supplier",
+        "Predicate" => "java.util.function.Predicate",
+        "Duration" => "java.time.Duration",
+        "Instant" => "java.time.Instant",
+        "LocalDate" => "java.time.LocalDate",
+        "LocalTime" => "java.time.LocalTime",
+        "LocalDateTime" => "java.time.LocalDateTime",
+        "BigDecimal" => "java.math.BigDecimal",
+        "BigInteger" => "java.math.BigInteger",
+        _ => {
+            if is_standard_java_lang_class(simple_name) {
+                let cand = format!("java.lang.{simple_name}");
+                return get_builtin_jdk_class(&cand);
+            }
+            let common = find_common_jdk_classes_by_name(simple_name);
+            if let Some(first) = common.into_iter().next() {
+                return get_builtin_jdk_class(&first);
+            }
+            return None;
+        }
+    };
+    get_builtin_jdk_class(fqn)
 }
 
 /// Returns true if the import matches common Java ecosystem frameworks (Spring, Jakarta, Lombok, Slf4j, etc.)

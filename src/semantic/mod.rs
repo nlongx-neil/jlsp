@@ -114,6 +114,54 @@ impl<'a> SemanticContext<'a> {
                         return Some(Arc::new(sym.class_info));
                     }
                 }
+                if crate::classpath::is_standard_jdk_package(imp) {
+                    if let Some(cls) = crate::classpath::get_builtin_jdk_class(imp) {
+                        return Some(Arc::new(cls));
+                    }
+                }
+                if let Some(cls) = crate::classpath::get_builtin_framework_class(imp) {
+                    return Some(Arc::new(cls));
+                }
+                if imp.contains('.') {
+                    let s_name = imp.rsplit('.').next().unwrap_or(imp);
+                    if s_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                        let pkg = imp.rsplitn(2, '.').nth(1).unwrap_or("");
+                        let info = ClassInfo {
+                            fqn: imp.clone(),
+                            simple_name: s_name.to_string(),
+                            package_name: pkg.to_string(),
+                            kind: crate::model::ClassKind::Class,
+                            super_class: Some("java.lang.Object".to_string()),
+                            interfaces: vec![],
+                            methods: vec![],
+                            fields: vec![],
+                            source_path: None,
+                            is_public: true,
+                        };
+                        return Some(Arc::new(info));
+                    }
+                }
+            }
+        }
+
+        // 3.5 Check wildcard imports (e.g., import java.util.concurrent.*;)
+        for imp in &self.imports {
+            if imp.ends_with(".*") {
+                let pkg = imp.trim_end_matches(".*");
+                let candidate_fqn = format!("{pkg}.{simple_name}");
+                if let Some(cls) = self.classpath.get_class(&candidate_fqn).await {
+                    return Some(cls);
+                }
+                if let Some(idx) = self.indexer {
+                    if let Some(sym) = idx.find_by_fqn(&candidate_fqn).await {
+                        return Some(Arc::new(sym.class_info));
+                    }
+                }
+                if crate::classpath::is_standard_jdk_package(&candidate_fqn) {
+                    if let Some(cls) = crate::classpath::get_builtin_jdk_class(&candidate_fqn) {
+                        return Some(Arc::new(cls));
+                    }
+                }
             }
         }
 
@@ -147,6 +195,17 @@ impl<'a> SemanticContext<'a> {
             if let Some(sym) = idx.find_candidate(simple_name, self.package.as_deref(), &self.imports).await {
                 return Some(Arc::new(sym.class_info));
             }
+        }
+
+        // 8. Fallback to common JDK classes if still not found
+        let common = crate::classpath::find_common_jdk_classes_by_name(simple_name);
+        for fqn in common {
+            if let Some(cls) = crate::classpath::get_builtin_jdk_class(&fqn) {
+                return Some(Arc::new(cls));
+            }
+        }
+        if let Some(cls) = crate::classpath::get_builtin_framework_class_by_simple_name(simple_name) {
+            return Some(Arc::new(cls));
         }
 
         None
@@ -349,32 +408,66 @@ impl<'a> SemanticContext<'a> {
                 }
                 if let Some(ref sp) = cls.source_path {
                     if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                        let mut line = 0;
+                        if let Ok(content) = std::fs::read_to_string(sp) {
+                            line = crate::syntax::find_target_line_in_source(&content, &cls.simple_name);
+                        }
                         return Some(GotoTarget::SourceFile {
                             path: sp.clone(),
-                            range: Range::default(),
+                            range: Range {
+                                start: crate::model::Position { line, character: 0 },
+                                end: crate::model::Position { line, character: cls.simple_name.len() as u32 },
+                            },
                         });
                     }
                 }
                 return Some(GotoTarget::External {
                     cls,
-                    target_name: None,
+                    target_name: Some(ident_text.to_string()),
                 });
             }
 
             // Check matching import statement on this line
             for (imp_range, imp_str) in self.ast.extract_imports_with_ranges() {
                 if imp_range.start.line <= line && line <= imp_range.end.line {
+                    let is_static = imp_str.starts_with("static ");
                     let clean = imp_str.trim_start_matches("static ").trim_end_matches(".*").trim();
-                    if let Some(cls) = self.classpath.get_class(clean).await {
+                    let (cls_lookup, member_target) = if is_static {
+                        let parts: Vec<&str> = clean.rsplitn(2, '.').collect();
+                        if parts.len() == 2 {
+                            (parts[1], Some(parts[0].to_string()))
+                        } else {
+                            (clean, None)
+                        }
+                    } else {
+                        (clean, None)
+                    };
+                    if let Some(cls) = self.classpath.get_class(cls_lookup).await {
                         return Some(GotoTarget::External {
                             cls,
-                            target_name: None,
+                            target_name: member_target,
                         });
                     }
-                    if let Some(cls) = self.resolve_type(clean).await {
+                    if let Some(cls) = self.resolve_type(cls_lookup).await {
+                        if let Some(ref sp) = cls.source_path {
+                            if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                                let target_sym = member_target.as_deref().unwrap_or(&cls.simple_name);
+                                let mut line = 0;
+                                if let Ok(content) = std::fs::read_to_string(sp) {
+                                    line = crate::syntax::find_target_line_in_source(&content, target_sym);
+                                }
+                                return Some(GotoTarget::SourceFile {
+                                    path: sp.clone(),
+                                    range: Range {
+                                        start: crate::model::Position { line, character: 0 },
+                                        end: crate::model::Position { line, character: target_sym.len() as u32 },
+                                    },
+                                });
+                            }
+                        }
                         return Some(GotoTarget::External {
                             cls,
-                            target_name: None,
+                            target_name: member_target,
                         });
                     }
                 }
@@ -464,9 +557,16 @@ impl<'a> SemanticContext<'a> {
                             // If defined in a project workspace source file
                             if let Some(ref sp) = cls_info.source_path {
                                 if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                                    let mut line = 0;
+                                    if let Ok(content) = std::fs::read_to_string(sp) {
+                                        line = crate::syntax::find_target_line_in_source(&content, &m_name);
+                                    }
                                     return Some(GotoTarget::SourceFile {
                                         path: sp.clone(),
-                                        range: Range::default(),
+                                        range: Range {
+                                            start: crate::model::Position { line, character: 0 },
+                                            end: crate::model::Position { line, character: m_name.len() as u32 },
+                                        },
                                     });
                                 }
                             }
@@ -496,9 +596,16 @@ impl<'a> SemanticContext<'a> {
             // Defined in a project workspace source file?
             if let Some(ref sp) = cls.source_path {
                 if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                    let mut line = 0;
+                    if let Ok(content) = std::fs::read_to_string(sp) {
+                        line = crate::syntax::find_target_line_in_source(&content, &cls.simple_name);
+                    }
                     return Some(GotoTarget::SourceFile {
                         path: sp.clone(),
-                        range: Range::default(),
+                        range: Range {
+                            start: crate::model::Position { line, character: 0 },
+                            end: crate::model::Position { line, character: cls.simple_name.len() as u32 },
+                        },
                     });
                 }
             }

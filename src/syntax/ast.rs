@@ -374,51 +374,192 @@ impl JavaAst {
         }
     }
 
+    /// Find the declaration line of a target class, interface, method, or field in Java source code
+    pub fn find_target_line_in_source(content: &str, target_name: &str) -> u32 {
+        let mut fallback_line = 0;
+        let mut found_fallback = false;
+
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                continue;
+            }
+
+            // Exact class / interface / enum / record / @interface definition (supports modifiers like public, final, abstract, static, sealed)
+            let has_type_keyword = line.contains("class ")
+                || line.contains("interface ")
+                || line.contains("enum ")
+                || line.contains("@interface ")
+                || line.contains("record ");
+            if has_type_keyword {
+                let patterns = [
+                    format!("class {}", target_name),
+                    format!("class {}<", target_name),
+                    format!("class {} ", target_name),
+                    format!("interface {}", target_name),
+                    format!("interface {}<", target_name),
+                    format!("interface {} ", target_name),
+                    format!("enum {}", target_name),
+                    format!("enum {} ", target_name),
+                    format!("@interface {}", target_name),
+                    format!("@interface {} ", target_name),
+                    format!("record {}", target_name),
+                    format!("record {}<", target_name),
+                    format!("record {} ", target_name),
+                ];
+                if patterns.iter().any(|pat| line.contains(pat)) {
+                    return idx as u32;
+                }
+            }
+
+            // Method declaration: `target_name(`
+            let method_pattern = format!("{}(", target_name);
+            if line.contains(&method_pattern) {
+                if trimmed.starts_with("public ") || trimmed.starts_with("protected ") || trimmed.starts_with("private ") || trimmed.starts_with("static ") || trimmed.starts_with("default ") {
+                    return idx as u32;
+                }
+                if !found_fallback {
+                    fallback_line = idx as u32;
+                    found_fallback = true;
+                }
+            }
+
+            // General fallback if target_name appears as a word
+            if !found_fallback && line.contains(target_name) {
+                fallback_line = idx as u32;
+                found_fallback = true;
+            }
+        }
+
+        fallback_line
+    }
+
+    /// Collect all identifier names and type names referenced in code (outside import and package declarations),
+    /// as well as identifier symbols referenced inside Javadoc comments (e.g. {@link Foo}, @see Foo).
+    pub fn collect_used_identifier_names(&self) -> std::collections::HashSet<String> {
+        let mut used = std::collections::HashSet::new();
+        let root = self.tree.root_node();
+
+        fn traverse(node: tree_sitter::Node, ast: &JavaAst, used: &mut std::collections::HashSet<String>) {
+            let kind = node.kind();
+            if kind == "package_declaration" || kind == "import_declaration" {
+                return;
+            }
+
+            if kind == "identifier" || kind == "type_identifier" {
+                used.insert(ast.node_text(&node).to_string());
+            } else if kind == "comment" || kind == "block_comment" || kind == "line_comment" {
+                let text = ast.node_text(&node);
+                // Extract Javadoc links, e.g. {@link ClassName} or @see ClassName
+                for word in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                    if !word.is_empty() && word.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+                        used.insert(word.to_string());
+                    }
+                }
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                traverse(child, ast, used);
+            }
+        }
+
+        traverse(root, self, &mut used);
+        used
+    }
+
     /// Analyze used identifier tokens and clean up imports:
     /// Returns sorted, unique, and referenced imports (preserving wildcards and static imports)
     pub fn organize_imports(&self) -> Vec<String> {
         let current_imports = self.extract_imports();
-        let mut used_imports = Vec::new();
+        let used_identifiers = self.collect_used_identifier_names();
+        let mut used_static = Vec::new();
+        let mut used_normal = Vec::new();
 
         for imp in current_imports {
             if imp.contains('*') {
                 // Wildcard imports must always be preserved
-                used_imports.push(imp);
+                if imp.starts_with("static ") {
+                    used_static.push(imp);
+                } else {
+                    used_normal.push(imp);
+                }
                 continue;
             }
 
+            let is_static = imp.starts_with("static ");
             let clean_imp = imp.strip_prefix("static ").unwrap_or(&imp);
             let simple_name = clean_imp.split('.').last().unwrap_or(clean_imp);
-            // Check if simple_name appears in file body
-            let occs = self.find_all_occurrences(simple_name);
-            // If it appears more than once (once is the import statement itself), it's used
-            if occs.len() > 1 {
-                used_imports.push(imp);
+
+            if used_identifiers.contains(simple_name) {
+                if is_static {
+                    used_static.push(imp);
+                } else {
+                    used_normal.push(imp);
+                }
             }
         }
 
-        used_imports.sort();
-        used_imports.dedup();
-        used_imports
+        // Deduplicate and sort static imports
+        used_static.sort();
+        used_static.dedup();
+
+        // Sort normal imports with standard Java package hierarchy:
+        // java.*, javax.*, then all other packages alphabetically
+        used_normal.sort_by(|a, b| {
+            fn package_group(pkg: &str) -> u8 {
+                if pkg.starts_with("java.") {
+                    0
+                } else if pkg.starts_with("javax.") {
+                    1
+                } else {
+                    2
+                }
+            }
+            let group_a = package_group(a);
+            let group_b = package_group(b);
+            if group_a != group_b {
+                group_a.cmp(&group_b)
+            } else {
+                a.cmp(b)
+            }
+        });
+        used_normal.dedup();
+
+        let mut result = used_static;
+        result.extend(used_normal);
+        result
     }
 
-    /// Find unused import declarations with their exact ranges
+    /// Find unused import declarations with their exact ranges (including duplicates)
     pub fn find_unused_imports(&self) -> Vec<(String, tower_lsp::lsp_types::Range)> {
         let root = self.tree.root_node();
+        let used_identifiers = self.collect_used_identifier_names();
         let mut unused = Vec::new();
+        let mut seen_imports = std::collections::HashSet::new();
+
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             if child.kind() == "import_declaration" {
                 let import_text = self.node_text(&child);
-                if import_text.contains('*') {
+                let clean = import_text.trim_start_matches("import ").trim_end_matches(';').trim().to_string();
+
+                // Detect duplicate imports
+                if !seen_imports.insert(clean.clone()) {
+                    unused.push((clean, self.node_lsp_range(&child)));
                     continue;
                 }
-                let clean = import_text.trim_start_matches("import ").trim_end_matches(';').trim();
-                let clean_no_static = clean.strip_prefix("static ").unwrap_or(clean);
+
+                if import_text.contains('*') {
+                    // Wildcard imports preserved
+                    continue;
+                }
+
+                let clean_no_static = clean.strip_prefix("static ").unwrap_or(&clean);
                 let simple_name = clean_no_static.split('.').last().unwrap_or(clean_no_static);
-                let occs = self.find_all_occurrences(simple_name);
-                if occs.len() <= 1 {
-                    unused.push((clean.to_string(), self.node_lsp_range(&child)));
+
+                if !used_identifiers.contains(simple_name) {
+                    unused.push((clean, self.node_lsp_range(&child)));
                 }
             }
         }
@@ -1010,33 +1151,363 @@ impl JavaAst {
             }
         }
 
-        // Collect final variables and fields to detect final reassignment
-        let mut final_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-        fn collect_finals(node: tree_sitter::Node, ast: &JavaAst, finals: &mut std::collections::HashSet<String>) {
-            if node.kind() == "local_variable_declaration" || node.kind() == "field_declaration" {
-                let is_final = node.children(&mut node.walk()).any(|c| (c.kind() == "modifiers" && ast.node_text(&c).contains("final")) || ast.node_text(&c) == "final");
-                if is_final {
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if child.kind() == "variable_declarator" {
-                            if let Some(name_node) = child.child_by_field_name("name") {
-                                finals.insert(ast.node_text(&name_node).to_string());
+        // Helper to check if a node has `final` modifier
+        fn has_final_modifier(node: &tree_sitter::Node, ast: &JavaAst) -> bool {
+            let mut cursor = node.walk();
+            for c in node.children(&mut cursor) {
+                if c.kind() == "modifiers" {
+                    let mut m_cursor = c.walk();
+                    for m_child in c.children(&mut m_cursor) {
+                        if m_child.kind() == "modifier" && ast.node_text(&m_child) == "final" {
+                            return true;
+                        }
+                    }
+                    if ast.node_text(&c).split_whitespace().any(|w| w == "final") {
+                        return true;
+                    }
+                } else if c.kind() == "modifier" {
+                    if ast.node_text(&c) == "final" {
+                        return true;
+                    }
+                } else if ast.node_text(&c) == "final" {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // Scope-aware final variable check
+        fn is_target_final(target_ident: &tree_sitter::Node, ast: &JavaAst) -> bool {
+            let target_name = ast.node_text(target_ident);
+            let mut curr = target_ident.parent();
+            let mut enclosing_callable_is_constructor = false;
+            let mut enclosing_is_initializer = false;
+            let mut callable_found = false;
+
+            while let Some(n) = curr {
+                let k = n.kind();
+
+                // Track whether the immediate enclosing callable is a constructor or initializer
+                if !callable_found {
+                    if matches!(k, "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" | "lambda_expression") {
+                        callable_found = true;
+                        enclosing_callable_is_constructor = k == "constructor_declaration";
+                    } else if k == "static_initializer" {
+                        callable_found = true;
+                        enclosing_is_initializer = true;
+                    } else if k == "block" && n.parent().map(|p| p.kind() == "class_body").unwrap_or(false) {
+                        callable_found = true;
+                        enclosing_is_initializer = true;
+                    }
+                }
+
+                // 1. Check local variable declarations in a block
+                if k == "block" {
+                    let mut cursor = n.walk();
+                    for child in n.children(&mut cursor) {
+                        if child.start_byte() < target_ident.start_byte() && child.kind() == "local_variable_declaration" {
+                            let mut v_cursor = child.walk();
+                            for v_child in child.children(&mut v_cursor) {
+                                if v_child.kind() == "variable_declarator" {
+                                    if let Some(name_node) = v_child.child_by_field_name("name") {
+                                        if ast.node_text(&name_node) == target_name {
+                                            return has_final_modifier(&child, ast);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                // 2. Check traditional for statement initializer: for (int i = 0; ...)
+                else if k == "for_statement" {
+                    let mut cursor = n.walk();
+                    for child in n.children(&mut cursor) {
+                        if child.kind() == "local_variable_declaration" {
+                            let mut v_cursor = child.walk();
+                            for v_child in child.children(&mut v_cursor) {
+                                if v_child.kind() == "variable_declarator" {
+                                    if let Some(name_node) = v_child.child_by_field_name("name") {
+                                        if ast.node_text(&name_node) == target_name {
+                                            return has_final_modifier(&child, ast);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // 3. Check enhanced for statement: for (FileStatus fs : files)
+                else if k == "enhanced_for_statement" {
+                    if let Some(name_node) = n.child_by_field_name("name") {
+                        if ast.node_text(&name_node) == target_name {
+                            return has_final_modifier(&n, ast);
+                        }
+                    }
+                }
+                // 4. Check catch clause: catch (IOException e)
+                else if k == "catch_clause" {
+                    let mut cursor = n.walk();
+                    for child in n.children(&mut cursor) {
+                        if child.kind() == "catch_formal_parameter" {
+                            if let Some(name_node) = child.child_by_field_name("name") {
+                                if ast.node_text(&name_node) == target_name {
+                                    return has_final_modifier(&child, ast);
+                                }
+                            }
+                        }
+                    }
+                }
+                // 5. Check try-with-resources
+                else if k == "try_with_resources_statement" || k == "resource_specification" {
+                    let mut cursor = n.walk();
+                    for child in n.children(&mut cursor) {
+                        if child.kind() == "resource" || child.kind() == "local_variable_declaration" {
+                            let mut v_cursor = child.walk();
+                            for v_child in child.children(&mut v_cursor) {
+                                if v_child.kind() == "variable_declarator" {
+                                    if let Some(name_node) = v_child.child_by_field_name("name") {
+                                        if ast.node_text(&name_node) == target_name {
+                                            return has_final_modifier(&child, ast);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(name_node) = child.child_by_field_name("name") {
+                                if ast.node_text(&name_node) == target_name {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // 6. Check method / constructor / lambda parameters
+                else if matches!(k, "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" | "lambda_expression") {
+                    if let Some(params) = n.child_by_field_name("parameters") {
+                        let mut cursor = params.walk();
+                        for child in params.children(&mut cursor) {
+                            if matches!(child.kind(), "formal_parameter" | "spread_parameter") {
+                                if let Some(name_node) = child.child_by_field_name("name") {
+                                    if ast.node_text(&name_node) == target_name {
+                                        return has_final_modifier(&child, ast);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // 7. Check enclosing class / record / enum / interface fields
+                else if matches!(k, "class_declaration" | "record_declaration" | "enum_declaration" | "interface_declaration") {
+                    if let Some(body) = n.child_by_field_name("body") {
+                        let mut cursor = body.walk();
+                        for child in body.children(&mut cursor) {
+                            if child.kind() == "field_declaration" {
+                                let mut v_cursor = child.walk();
+                                for v_child in child.children(&mut v_cursor) {
+                                    if v_child.kind() == "variable_declarator" {
+                                        if let Some(name_node) = v_child.child_by_field_name("name") {
+                                            if ast.node_text(&name_node) == target_name {
+                                                if !has_final_modifier(&child, ast) {
+                                                    return false;
+                                                }
+                                                // If in constructor or initializer and field has no initializer, it is blank final initialization
+                                                if (enclosing_callable_is_constructor || enclosing_is_initializer) && v_child.child_by_field_name("value").is_none() {
+                                                    return false;
+                                                }
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if k == "record_declaration" {
+                        if let Some(header) = n.child_by_field_name("parameters") {
+                            let mut cursor = header.walk();
+                            for child in header.children(&mut cursor) {
+                                if child.kind() == "formal_parameter" || child.kind() == "record_pattern_component" {
+                                    if let Some(name_node) = child.child_by_field_name("name") {
+                                        if ast.node_text(&name_node) == target_name {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                curr = n.parent();
             }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_finals(child, ast, finals);
-            }
+
+            false
         }
-        collect_finals(root, self, &mut final_vars);
+
+        // Helper to determine if an exception class is a checked exception
+        fn is_checked_exception(type_name: &str) -> bool {
+            let clean = type_name.split('<').next().unwrap_or(type_name).trim();
+            let simple_name = clean.split('.').last().unwrap_or(clean);
+
+            // 1. Explicit unchecked exceptions: RuntimeException and Error subclasses
+            if simple_name == "RuntimeException" || simple_name.ends_with("RuntimeException") {
+                return false;
+            }
+            if simple_name == "Error" || simple_name.ends_with("Error") {
+                return false;
+            }
+            if matches!(
+                simple_name,
+                "IllegalArgumentException"
+                    | "IllegalStateException"
+                    | "NullPointerException"
+                    | "IndexOutOfBoundsException"
+                    | "ArrayIndexOutOfBoundsException"
+                    | "StringIndexOutOfBoundsException"
+                    | "UnsupportedOperationException"
+                    | "NoSuchElementException"
+                    | "ConcurrentModificationException"
+                    | "SecurityException"
+                    | "ArithmeticException"
+                    | "ClassCastException"
+                    | "NumberFormatException"
+                    | "ArrayStoreException"
+                    | "NegativeArraySizeException"
+                    | "TypeNotPresentException"
+                    | "BufferOverflowException"
+                    | "BufferUnderflowException"
+                    | "EmptyStackException"
+                    | "MissingResourceException"
+                    | "IllegalMonitorStateException"
+                    | "IllegalThreadStateException"
+                    | "InputMismatchException"
+                    | "MalformedParameterizedTypeException"
+                    | "UncheckedIOException"
+                    | "DateTimeException"
+            ) {
+                return false;
+            }
+
+            // 2. Explicit checked exceptions: Throwable, Exception (not RuntimeException), and well-known checked exceptions
+            if simple_name == "Throwable" || simple_name == "Exception" || simple_name.ends_with("CheckedException") {
+                return true;
+            }
+
+            matches!(
+                simple_name,
+                "IOException"
+                    | "SQLException"
+                    | "ClassNotFoundException"
+                    | "NoSuchMethodException"
+                    | "NoSuchFieldException"
+                    | "IllegalAccessException"
+                    | "InstantiationException"
+                    | "InvocationTargetException"
+                    | "InterruptedException"
+                    | "ParseException"
+                    | "TimeoutException"
+                    | "ExecutionException"
+                    | "CloneNotSupportedException"
+                    | "CertificateException"
+                    | "URISyntaxException"
+                    | "MalformedURLException"
+                    | "GeneralSecurityException"
+                    | "KeyException"
+                    | "NoSuchAlgorithmException"
+                    | "SignatureException"
+                    | "DigestException"
+                    | "InvalidKeySpecException"
+                    | "BadPaddingException"
+                    | "IllegalBlockSizeException"
+                    | "NoSuchPaddingException"
+                    | "SAXException"
+                    | "ParserConfigurationException"
+                    | "NamingException"
+                    | "JMSException"
+                    | "ServletException"
+                    | "FileNotFoundException"
+                    | "SocketException"
+                    | "UnknownHostException"
+                    | "EOFException"
+                    | "ZipException"
+                    | "JarException"
+                    | "BadLocationException"
+                    | "UnsupportedAudioFileException"
+                    | "LineUnavailableException"
+                    | "MimeTypeParseException"
+                    | "PrinterException"
+                    | "AWTException"
+                    | "FontFormatException"
+                    | "DataFormatException"
+                    | "BrokenBarrierException"
+                    | "ReflectiveOperationException"
+                    | "InvalidPropertiesFormatException"
+            )
+        }
+
+        // Helper to extract the thrown exception type name from a throw_statement
+        fn get_thrown_exception_type(throw_node: &tree_sitter::Node, ast: &JavaAst) -> Option<String> {
+            let mut cursor = throw_node.walk();
+            for child in throw_node.children(&mut cursor) {
+                if child.kind() == "object_creation_expression" {
+                    if let Some(ty) = child.child_by_field_name("type") {
+                        let raw_text = ast.node_text(&ty);
+                        let clean = raw_text.split('<').next().unwrap_or(raw_text).trim();
+                        let simple = clean.split('.').last().unwrap_or(clean);
+                        return Some(simple.to_string());
+                    }
+                } else if child.kind() == "identifier" {
+                    let var_name = ast.node_text(&child);
+                    let mut curr = child.parent();
+                    while let Some(n) = curr {
+                        if n.kind() == "catch_clause" {
+                            let mut c_cursor = n.walk();
+                            for c_child in n.children(&mut c_cursor) {
+                                if c_child.kind() == "catch_formal_parameter" {
+                                    if let Some(name_node) = c_child.child_by_field_name("name") {
+                                        if ast.node_text(&name_node) == var_name {
+                                            if let Some(ty_node) = c_child.child_by_field_name("type") {
+                                                let raw_text = ast.node_text(&ty_node);
+                                                let clean = raw_text.split('<').next().unwrap_or(raw_text).trim();
+                                                let simple = clean.split('.').last().unwrap_or(clean);
+                                                return Some(simple.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if n.kind() == "block" {
+                            let mut b_cursor = n.walk();
+                            for b_child in n.children(&mut b_cursor) {
+                                if b_child.start_byte() < child.start_byte() && b_child.kind() == "local_variable_declaration" {
+                                    let mut v_cursor = b_child.walk();
+                                    for v_child in b_child.children(&mut v_cursor) {
+                                        if v_child.kind() == "variable_declarator" {
+                                            if let Some(name_node) = v_child.child_by_field_name("name") {
+                                                if ast.node_text(&name_node) == var_name {
+                                                    if let Some(ty_node) = b_child.child_by_field_name("type") {
+                                                        let raw_text = ast.node_text(&ty_node);
+                                                        let clean = raw_text.split('<').next().unwrap_or(raw_text).trim();
+                                                        let simple = clean.split('.').last().unwrap_or(clean);
+                                                        return Some(simple.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        curr = n.parent();
+                    }
+                }
+            }
+            None
+        }
 
         fn traverse(
             node: tree_sitter::Node,
             ast: &JavaAst,
-            final_vars: &std::collections::HashSet<String>,
             out: &mut Vec<SemanticDiagnostic>,
         ) {
             // Check local variable declaration type mismatches, e.g. int x = "hello";
@@ -1083,7 +1554,7 @@ impl JavaAst {
                 if let Some(left) = node.child_by_field_name("left") {
                     if left.kind() == "identifier" {
                         let name = ast.node_text(&left);
-                        if final_vars.contains(name) {
+                        if is_target_final(&left, ast) {
                             out.push(SemanticDiagnostic {
                                 range: ast.node_range(&left),
                                 message: format!("Cannot assign a value to final variable '{}'", name),
@@ -1097,7 +1568,7 @@ impl JavaAst {
                 for child in node.children(&mut cursor) {
                     if child.kind() == "identifier" {
                         let name = ast.node_text(&child);
-                        if final_vars.contains(name) {
+                        if is_target_final(&child, ast) {
                             out.push(SemanticDiagnostic {
                                 range: ast.node_range(&child),
                                 message: format!("Cannot assign a value to final variable '{}'", name),
@@ -1277,28 +1748,131 @@ impl JavaAst {
 
                         // Missing return statement check in non-void concrete methods
                         if !is_void && !is_abstract && !is_native && !in_interface {
-                            fn definitely_returns(stmt: tree_sitter::Node) -> bool {
+                            fn definitely_returns(stmt: tree_sitter::Node, ast: &JavaAst) -> bool {
                                 match stmt.kind() {
                                     "return_statement" | "throw_statement" => true,
                                     "block" => {
                                         let mut cursor = stmt.walk();
                                         let children: Vec<_> = stmt.children(&mut cursor).filter(|c| c.kind() != "{" && c.kind() != "}").collect();
-                                        children.last().map(|s| definitely_returns(*s)).unwrap_or(false)
+                                        children.iter().any(|s| definitely_returns(*s, ast))
                                     }
                                     "if_statement" => {
                                         let cons = stmt.child_by_field_name("consequence");
                                         let alt = stmt.child_by_field_name("alternative");
                                         if let (Some(c), Some(a)) = (cons, alt) {
-                                            definitely_returns(c) && definitely_returns(a)
+                                            definitely_returns(c, ast) && definitely_returns(a, ast)
                                         } else {
                                             false
                                         }
+                                    }
+                                    "switch_expression" | "switch_statement" => {
+                                        let block_opt = stmt.child_by_field_name("body")
+                                            .or_else(|| stmt.children(&mut stmt.walk()).find(|c| c.kind() == "switch_block"));
+                                        if let Some(sb) = block_opt {
+                                            let mut cursor = sb.walk();
+                                            let groups: Vec<_> = sb.children(&mut cursor)
+                                                .filter(|c| c.kind() == "switch_block_statement_group" || c.kind() == "switch_rule")
+                                                .collect();
+
+                                            if groups.is_empty() {
+                                                return false;
+                                            }
+
+                                            let mut has_default = false;
+                                            for group in &groups {
+                                                if group.kind() == "switch_block_statement_group" {
+                                                    let group_has_default = group.children(&mut group.walk()).any(|c| {
+                                                        c.kind() == "switch_label" && (
+                                                            c.children(&mut c.walk()).any(|k| k.kind() == "default")
+                                                            || ast.node_text(&c).trim().starts_with("default")
+                                                        )
+                                                    });
+                                                    if group_has_default {
+                                                        has_default = true;
+                                                    }
+                                                    let stmts: Vec<_> = group.children(&mut group.walk())
+                                                        .filter(|c| c.kind() != "switch_label" && c.kind() != ":" && c.is_named())
+                                                        .collect();
+                                                    let group_returns = stmts.iter().any(|s| definitely_returns(*s, ast));
+                                                    if !group_returns {
+                                                        return false;
+                                                    }
+                                                } else if group.kind() == "switch_rule" {
+                                                    let rule_has_default = group.children(&mut group.walk()).any(|c| {
+                                                        c.kind() == "switch_label" && (
+                                                            c.children(&mut c.walk()).any(|k| k.kind() == "default")
+                                                            || ast.node_text(&c).trim().starts_with("default")
+                                                        )
+                                                    });
+                                                    if rule_has_default {
+                                                        has_default = true;
+                                                    }
+                                                    let rule_body = group.children(&mut group.walk())
+                                                        .find(|c| c.kind() != "switch_label" && c.kind() != "->" && c.is_named());
+                                                    if let Some(rb) = rule_body {
+                                                        if !definitely_returns(rb, ast) {
+                                                            return false;
+                                                        }
+                                                    } else {
+                                                        return false;
+                                                    }
+                                                }
+                                            }
+                                            has_default
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    "try_statement" | "try_with_resources_statement" => {
+                                        let finally_clause = stmt.children(&mut stmt.walk()).find(|c| c.kind() == "finally_clause");
+                                        if let Some(fc) = finally_clause {
+                                            if let Some(f_body) = fc.child_by_field_name("body").or_else(|| fc.children(&mut fc.walk()).find(|c| c.kind() == "block")) {
+                                                if definitely_returns(f_body, ast) {
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                        let try_body = stmt.child_by_field_name("body")
+                                            .or_else(|| stmt.children(&mut stmt.walk()).find(|c| c.kind() == "block"));
+                                        let try_returns = try_body.map(|b| definitely_returns(b, ast)).unwrap_or(false);
+                                        if !try_returns {
+                                            return false;
+                                        }
+                                        let catch_clauses: Vec<_> = stmt.children(&mut stmt.walk()).filter(|c| c.kind() == "catch_clause").collect();
+                                        for cc in catch_clauses {
+                                            let c_body = cc.child_by_field_name("body")
+                                                .or_else(|| cc.children(&mut cc.walk()).find(|c| c.kind() == "block"));
+                                            if let Some(cb) = c_body {
+                                                if !definitely_returns(cb, ast) {
+                                                    return false;
+                                                }
+                                            } else {
+                                                return false;
+                                            }
+                                        }
+                                        true
+                                    }
+                                    "synchronized_statement" => {
+                                        stmt.child_by_field_name("body")
+                                            .or_else(|| stmt.children(&mut stmt.walk()).find(|c| c.kind() == "block"))
+                                            .map(|b| definitely_returns(b, ast))
+                                            .unwrap_or(false)
+                                    }
+                                    "labeled_statement" => {
+                                        stmt.child_by_field_name("statement")
+                                            .map(|s| definitely_returns(s, ast))
+                                            .unwrap_or(false)
+                                    }
+                                    "do_statement" => {
+                                        stmt.child_by_field_name("body")
+                                            .map(|b| definitely_returns(b, ast))
+                                            .unwrap_or(false)
                                     }
                                     _ => false,
                                 }
                             }
 
-                            if !definitely_returns(body) {
+                            if !definitely_returns(body, ast) {
                                 let name_node = node.child_by_field_name("name").unwrap_or(node);
                                 out.push(SemanticDiagnostic {
                                     range: ast.node_range(&name_node),
@@ -1485,35 +2059,45 @@ impl JavaAst {
                 }
             }
 
-            // Check for unhandled throw statement outside try-catch
+            // Check for unhandled throw statement outside try-catch (checked exceptions only)
             if node.kind() == "throw_statement" {
-                let mut in_try = false;
-                let mut p = node.parent();
-                while let Some(parent_node) = p {
-                    if parent_node.kind() == "try_statement" || parent_node.kind() == "try_with_resources_statement" {
-                        in_try = true;
-                        break;
-                    }
-                    if parent_node.kind() == "method_declaration" || parent_node.kind() == "constructor_declaration" {
-                        let throws_node = parent_node.child_by_field_name("throws")
-                            .or_else(|| parent_node.children(&mut parent_node.walk()).find(|c| c.kind() == "throws"));
-                        if throws_node.is_some() {
-                            in_try = true;
+                if let Some(exc_name) = get_thrown_exception_type(&node, ast) {
+                    if is_checked_exception(&exc_name) {
+                        let mut in_try = false;
+                        let mut p = node.parent();
+                        while let Some(parent_node) = p {
+                            if parent_node.kind() == "try_statement" || parent_node.kind() == "try_with_resources_statement" {
+                                let text = ast.node_text(&parent_node);
+                                if text.contains(&exc_name) || text.contains("Exception") || text.contains("Throwable") {
+                                    in_try = true;
+                                    break;
+                                }
+                            }
+                            if parent_node.kind() == "method_declaration" || parent_node.kind() == "constructor_declaration" {
+                                let throws_node = parent_node.child_by_field_name("throws")
+                                    .or_else(|| parent_node.children(&mut parent_node.walk()).find(|c| c.kind() == "throws"));
+                                if let Some(throws_node) = throws_node {
+                                    let t_text = ast.node_text(&throws_node);
+                                    if t_text.contains(&exc_name) || t_text.contains("Exception") || t_text.contains("Throwable") {
+                                        in_try = true;
+                                    }
+                                }
+                                break;
+                            }
+                            if parent_node.kind() == "lambda_expression" {
+                                break;
+                            }
+                            p = parent_node.parent();
                         }
-                        break;
-                    }
-                    if parent_node.kind() == "lambda_expression" {
-                        break;
-                    }
-                    p = parent_node.parent();
-                }
 
-                if !in_try {
-                    out.push(SemanticDiagnostic {
-                        range: ast.node_range(&node),
-                        message: "Unhandled exception: type must be caught or declared to be thrown".to_string(),
-                        code: DiagnosticCode::UnhandledException,
-                    });
+                        if !in_try {
+                            out.push(SemanticDiagnostic {
+                                range: ast.node_range(&node),
+                                message: format!("Unhandled exception: {}; must be caught or declared to be thrown", exc_name),
+                                code: DiagnosticCode::UnhandledException,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1894,11 +2478,11 @@ impl JavaAst {
 
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                traverse(child, ast, final_vars, out);
+                traverse(child, ast, out);
             }
         }
 
-        traverse(root, self, &final_vars, &mut diags);
+        traverse(root, self, &mut diags);
         diags
     }
 
@@ -4669,6 +5253,11 @@ impl JavaAst {
     }
 }
 
+/// Free function version of find_target_line_in_source
+pub fn find_target_line_in_source(content: &str, target_name: &str) -> u32 {
+    JavaAst::find_target_line_in_source(content, target_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5042,6 +5631,33 @@ public class Demo {
     }
 
     #[test]
+    fn test_find_unused_imports_and_duplicates() {
+        let code = r#"package com.example;
+
+import java.util.List;
+import java.util.List;
+import java.util.Map;
+import com.example.JavadocDoc;
+
+/**
+ * See {@link JavadocDoc}
+ */
+public class Demo {
+    private List<String> items;
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        let unused = ast.find_unused_imports();
+        let unused_names: Vec<_> = unused.iter().map(|(n, _)| n.as_str()).collect();
+        // Duplicate List should be flagged as unused
+        assert!(unused_names.contains(&"java.util.List"));
+        // Unused Map should be flagged as unused
+        assert!(unused_names.contains(&"java.util.Map"));
+        // JavadocDoc is referenced in Javadoc comment, so it should NOT be flagged as unused
+        assert!(!unused_names.contains(&"com.example.JavadocDoc"));
+    }
+
+    #[test]
     fn test_is_definition_node_and_range() {
         let code = r#"public class Person {
     private String name;
@@ -5121,6 +5737,27 @@ public class TestFinal {
         let diags2 = ast2.collect_semantic_diagnostics_detailed(Some("TestFinal"));
         let final_errs: Vec<_> = diags2.iter().filter(|d| d.code == DiagnosticCode::FinalReassignment).collect();
         assert_eq!(final_errs.len(), 2, "Expected 2 final reassignment errors (x = 200 and x++)");
+
+        // 2b. Non-final local variable in method with inner class declaring final field with same name
+        let code2b = r#"
+public class FilePackager {
+    public static void packageFiles() {
+        long totalBytes = 0;
+        for (FileStatus fs : files) totalBytes += fs.getLen();
+    }
+
+    private static class LZWProgress {
+        private final long totalBytes;
+        LZWProgress(long totalBytes) {
+            this.totalBytes = totalBytes;
+        }
+    }
+}
+"#;
+        let ast2b = JavaAst::parse(Arc::new(code2b.to_string())).unwrap();
+        let diags2b = ast2b.collect_semantic_diagnostics_detailed(Some("FilePackager"));
+        let final_errs2b: Vec<_> = diags2b.iter().filter(|d| d.code == DiagnosticCode::FinalReassignment).collect();
+        assert_eq!(final_errs2b.len(), 0, "Non-final local totalBytes must not produce FinalReassignment error");
 
         // 3. Duplicate variable declaration in same block
         let code3 = r#"
@@ -5314,6 +5951,66 @@ class Demo {
     }
 
     #[test]
+    fn test_throw_runtime_exception_not_flagged() {
+        // 1. Unchecked exception (RuntimeException) should not be flagged as unhandled
+        let code1 = r#"
+class Demo {
+    public void validate() {
+        StringBuilder sb = new StringBuilder("error");
+        throw new RuntimeException(sb.toString());
+    }
+}
+"#;
+        let ast1 = JavaAst::parse(Arc::new(code1.to_string())).unwrap();
+        let diags1 = ast1.collect_semantic_diagnostics_detailed(Some("Demo"));
+        let unhandled1: Vec<_> = diags1.iter().filter(|d| d.code == DiagnosticCode::UnhandledException).collect();
+        assert!(unhandled1.is_empty(), "throw new RuntimeException must NOT be flagged as unhandled exception! Found: {:?}", unhandled1);
+
+        // 2. Checked exception without throws must be flagged with exact exception name
+        let code2 = r#"
+class Demo {
+    public void check() {
+        throw new IOException("error");
+    }
+}
+"#;
+        let ast2 = JavaAst::parse(Arc::new(code2.to_string())).unwrap();
+        let diags2 = ast2.collect_semantic_diagnostics_detailed(Some("Demo"));
+        let unhandled2: Vec<_> = diags2.iter().filter(|d| d.code == DiagnosticCode::UnhandledException).collect();
+        assert_eq!(unhandled2.len(), 1, "throw new IOException without throws must be flagged");
+        assert!(unhandled2[0].message.contains("IOException"), "Message must contain IOException, got: {}", unhandled2[0].message);
+    }
+
+    #[test]
+    fn test_datasource_config_final() {
+        let code = r#"
+public class DataSourceConfig {
+    private final DruidDataSource dataSource;
+    private static final String DRIVER;
+
+    static {
+        DRIVER = "com.mysql.cj.jdbc.Driver";
+    }
+
+    private DataSourceConfig() {
+        AppConfiguration config = AppConfiguration.getInstance();
+        dataSource = new DruidDataSource();
+    }
+
+    public void test() {
+        // Assigning final field outside constructor must still be flagged!
+        dataSource = null;
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        let diags = ast.collect_semantic_diagnostics_detailed(Some("DataSourceConfig"));
+        let final_errs: Vec<_> = diags.iter().filter(|d| d.code == DiagnosticCode::FinalReassignment).collect();
+        assert_eq!(final_errs.len(), 1, "Only dataSource = null in test() should be flagged as final reassignment, got: {:?}", final_errs);
+        assert_eq!(final_errs[0].range.start.line, 16);
+    }
+
+    #[test]
     fn test_void_method_type_node() {
         let code = r#"
 class Demo {
@@ -5354,6 +6051,41 @@ class Demo {
         let diags2 = ast2.collect_semantic_diagnostics_detailed(Some("Demo"));
         let missing_ret: Vec<_> = diags2.iter().filter(|d| d.code == DiagnosticCode::MissingReturn).collect();
         assert!(missing_ret.is_empty(), "Should NOT report missing return on void method after incremental edit! Found: {:?}", missing_ret);
+    }
+
+    #[test]
+    fn test_switch_definitely_returns() {
+        let code = r#"
+class Demo {
+    private static String formatLabel(String compressType) {
+        switch (compressType) {
+            case "gz":   return "gzip(.gz/.dat.gz)";
+            case "Z":    return "compress(.Z/.dat.Z)";
+            case "zstd": return "zstd(.zst/.zstd)";
+            default:     return compressType;
+        }
+    }
+
+    private int parseWithTry(String s) {
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private String arrowSwitch(int x) {
+        return switch (x) {
+            case 1 -> "one";
+            default -> "other";
+        };
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+        let diags = ast.collect_semantic_diagnostics_detailed(Some("Demo"));
+        let missing_ret: Vec<_> = diags.iter().filter(|d| d.code == DiagnosticCode::MissingReturn).collect();
+        assert!(missing_ret.is_empty(), "Should NOT report missing return when switch or try covers all cases! Found: {:?}", missing_ret);
     }
 }
 

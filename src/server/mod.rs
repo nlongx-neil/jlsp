@@ -66,22 +66,29 @@ fn find_target_line_in_source(content: &str, target_name: &str) -> u32 {
             continue;
         }
 
-        // Exact class / interface / enum / record / @interface definition
-        if trimmed.starts_with("public class ") || trimmed.starts_with("class ")
-            || trimmed.starts_with("public interface ") || trimmed.starts_with("interface ")
-            || trimmed.starts_with("public enum ") || trimmed.starts_with("enum ")
-            || trimmed.starts_with("public @interface ") || trimmed.starts_with("@interface ")
-            || trimmed.starts_with("public record ") || trimmed.starts_with("record ")
-        {
-            if line.contains(&format!("class {}", target_name))
-                || line.contains(&format!("interface {}", target_name))
-                || line.contains(&format!("enum {}", target_name))
-                || line.contains(&format!("@interface {}", target_name))
-                || line.contains(&format!("record {}", target_name))
-                || line.contains(&format!("class {}<", target_name))
-                || line.contains(&format!("interface {}<", target_name))
-                || line.contains(&format!("record {}<", target_name))
-            {
+        // Exact class / interface / enum / record / @interface definition (supports modifiers like public, final, abstract, static, sealed)
+        let has_type_keyword = line.contains("class ")
+            || line.contains("interface ")
+            || line.contains("enum ")
+            || line.contains("@interface ")
+            || line.contains("record ");
+        if has_type_keyword {
+            let patterns = [
+                format!("class {}", target_name),
+                format!("class {}<", target_name),
+                format!("class {} ", target_name),
+                format!("interface {}", target_name),
+                format!("interface {}<", target_name),
+                format!("interface {} ", target_name),
+                format!("enum {}", target_name),
+                format!("enum {} ", target_name),
+                format!("@interface {}", target_name),
+                format!("@interface {} ", target_name),
+                format!("record {}", target_name),
+                format!("record {}<", target_name),
+                format!("record {} ", target_name),
+            ];
+            if patterns.iter().any(|pat| line.contains(pat)) {
                 return idx as u32;
             }
         }
@@ -301,8 +308,23 @@ impl JlspServer {
             }
         }
 
+        // 3b. Contextual check: Unused / duplicate imports (dimmed with UNNECESSARY tag)
+        for (imp_name, imp_range) in ast.find_unused_imports() {
+            diagnostics.push(Diagnostic {
+                range: imp_range,
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("unused-import".to_string())),
+                code_description: None,
+                source: Some("jlsp".to_string()),
+                message: format!("The import '{}' is never used", imp_name),
+                related_information: None,
+                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                data: None,
+            });
+        }
+
         // 4. Contextual check: Unimplemented abstract/interface methods
-        let sem = SemanticContext::new(ast, &self.classpath).await;
+        let sem = SemanticContext::with_indexer(ast, &self.classpath, Some(&self.indexer)).await;
         for (class_name, missing_methods) in sem.find_missing_abstract_methods().await {
             let names: Vec<&str> = missing_methods.iter().map(|m| m.name.as_str()).collect();
             // Find class identifier range
@@ -443,7 +465,8 @@ impl JlspServer {
         let target_dir = base_cache_dir.join(&pkg_path);
         let _ = std::fs::create_dir_all(&target_dir);
 
-        let stub_file_name = format!("{}.java", cls_info.simple_name);
+        let clean_simple_name = cls_info.simple_name.split('$').next().unwrap_or(&cls_info.simple_name);
+        let stub_file_name = format!("{}.java", clean_simple_name);
         let dest_file_path = target_dir.join(&stub_file_name);
 
         // If file already exists and was previously marked read-only, make it writable to allow updating
@@ -496,18 +519,31 @@ impl JlspServer {
         &self,
         import_content: &str,
         sem: &SemanticContext<'_>,
-    ) -> Option<crate::model::ClassInfo> {
+    ) -> Option<(crate::model::ClassInfo, String)> {
         let clean = import_content.trim();
         if clean.starts_with("static ") {
             let rest = clean.trim_start_matches("static ").trim();
             let parts: Vec<&str> = rest.rsplitn(2, '.').collect();
             if parts.len() == 2 {
                 let cls_fqn = parts[1];
+                let member = parts[0].to_string();
                 if let Some(cls) = self.classpath.get_class(cls_fqn).await {
-                    return Some((*cls).clone());
+                    return Some(((*cls).clone(), member));
                 }
                 if let Some(cls) = sem.resolve_type(cls_fqn).await {
-                    return Some((*cls).clone());
+                    return Some(((*cls).clone(), member));
+                }
+                let simple_name = cls_fqn.rsplit('.').next().unwrap_or(cls_fqn);
+                if let Some(sym) = self.indexer.find_by_fqn(cls_fqn).await {
+                    let mut info = sym.class_info.clone();
+                    info.source_path = Some(sym.path.to_string_lossy().to_string());
+                    return Some((info, member));
+                }
+                let ws = self.indexer.find_by_simple_name(simple_name).await;
+                if let Some(item) = ws.into_iter().next() {
+                    let mut info = item.class_info.clone();
+                    info.source_path = Some(item.path.to_string_lossy().to_string());
+                    return Some((info, member));
                 }
             }
             return None;
@@ -519,31 +555,75 @@ impl JlspServer {
 
         // Direct FQN lookup in classpath
         if let Some(cls) = self.classpath.get_class(clean).await {
-            return Some((*cls).clone());
+            let s_name = cls.simple_name.clone();
+            return Some(((*cls).clone(), s_name));
         }
 
         // Direct FQN / SimpleName lookup in semantic context
         if let Some(cls) = sem.resolve_type(clean).await {
-            return Some((*cls).clone());
+            let s_name = cls.simple_name.clone();
+            return Some(((*cls).clone(), s_name));
         }
 
         // Check simple name in classpath
         let simple_name = clean.rsplit('.').next().unwrap_or(clean);
         if let Some(cls) = sem.resolve_type(simple_name).await {
-            return Some((*cls).clone());
+            let s_name = cls.simple_name.clone();
+            return Some(((*cls).clone(), s_name));
         }
 
         let matches = self.classpath.find_classes_by_simple_name(simple_name).await;
         if let Some(cls) = matches.into_iter().next() {
-            return Some((*cls).clone());
+            let s_name = cls.simple_name.clone();
+            return Some(((*cls).clone(), s_name));
         }
 
-        // Check workspace index
+        // Check workspace index by exact FQN first
+        if let Some(sym) = self.indexer.find_by_fqn(clean).await {
+            let mut info = sym.class_info.clone();
+            info.source_path = Some(sym.path.to_string_lossy().to_string());
+            let s_name = info.simple_name.clone();
+            return Some((info, s_name));
+        }
+
+        // Check workspace index by simple name
         let ws = self.indexer.find_by_simple_name(simple_name).await;
         if let Some(item) = ws.into_iter().next() {
             let mut info = item.class_info.clone();
             info.source_path = Some(item.path.to_string_lossy().to_string());
-            return Some(info);
+            let s_name = info.simple_name.clone();
+            return Some((info, s_name));
+        }
+
+        // Fallback for standard JDK or known framework classes
+        if crate::classpath::is_standard_jdk_package(clean) {
+            if let Some(cls) = crate::classpath::get_builtin_jdk_class(clean) {
+                return Some((cls, simple_name.to_string()));
+            }
+        }
+        if let Some(cls) = crate::classpath::get_builtin_framework_class(clean) {
+            return Some((cls, simple_name.to_string()));
+        }
+
+        // Final fallback: synthesize external ClassInfo for any valid dotted package import
+        if clean.contains('.') {
+            let s_name = clean.rsplit('.').next().unwrap_or(clean);
+            if s_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                let pkg = clean.rsplitn(2, '.').nth(1).unwrap_or("");
+                let info = crate::model::ClassInfo {
+                    fqn: clean.to_string(),
+                    simple_name: s_name.to_string(),
+                    package_name: pkg.to_string(),
+                    kind: crate::model::ClassKind::Class,
+                    super_class: Some("java.lang.Object".to_string()),
+                    interfaces: vec![],
+                    methods: vec![],
+                    fields: vec![],
+                    source_path: None,
+                    is_public: true,
+                };
+                return Some((info, s_name.to_string()));
+            }
         }
 
         None
@@ -2514,7 +2594,7 @@ impl LanguageServer for JlspServer {
             }
         }
 
-        let sem = SemanticContext::new(&doc.ast, &self.classpath).await;
+        let sem = SemanticContext::with_indexer(&doc.ast, &self.classpath, Some(&self.indexer)).await;
 
         let current_pkg = doc.ast.extract_package();
         let current_imports = doc.ast.extract_imports();
@@ -2526,8 +2606,15 @@ impl LanguageServer for JlspServer {
                 .trim_start_matches("import ")
                 .trim_end_matches(';')
                 .trim();
-            if let Some(target_cls) = self.resolve_import_target(import_content, &sem).await {
-                let target_name = target_cls.simple_name.clone();
+            if let Some((target_cls, default_member)) = self.resolve_import_target(import_content, &sem).await {
+                let clicked_word = sem.find_node_at_position(pos.line, pos.character)
+                    .map(|n| doc.ast.node_text(&n).to_string())
+                    .unwrap_or_default();
+                let target_name = if !clicked_word.is_empty() && (clicked_word == target_cls.simple_name || clicked_word == default_member) {
+                    clicked_word
+                } else {
+                    default_member
+                };
                 if let Some(loc) = self.resolve_external_target_location(&target_cls, &target_name).await {
                     return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
                 }
@@ -2606,11 +2693,15 @@ impl LanguageServer for JlspServer {
                 for sw in &search_words {
                     if let Some(target) = self.indexer.find_candidate(sw, current_pkg.as_deref(), &current_imports).await {
                         if let Ok(target_uri) = Url::from_file_path(&target.path) {
+                            let mut target_line = 0;
+                            if let Ok(content) = std::fs::read_to_string(&target.path) {
+                                target_line = crate::syntax::find_target_line_in_source(&content, &target.simple_name);
+                            }
                             let loc = Location {
                                 uri: target_uri,
                                 range: Range {
-                                    start: Position { line: 0, character: 0 },
-                                    end: Position { line: 0, character: 0 },
+                                    start: Position { line: target_line, character: 0 },
+                                    end: Position { line: target_line, character: target.simple_name.len() as u32 },
                                 },
                             };
                             return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
@@ -2737,18 +2828,33 @@ impl LanguageServer for JlspServer {
                 }
                 crate::semantic::GotoTarget::SourceFile { path, range } => {
                     if let Ok(target_uri) = Url::from_file_path(&path) {
+                        let mut target_range = Range {
+                            start: Position {
+                                line: range.start.line,
+                                character: range.start.character,
+                            },
+                            end: Position {
+                                line: range.end.line,
+                                character: range.end.character,
+                            },
+                        };
+                        if target_range.start.line == 0 && target_range.start.character == 0 {
+                            let word = sem.find_node_at_position(pos.line, pos.character)
+                                .map(|n| doc.ast.node_text(&n).to_string())
+                                .unwrap_or_default();
+                            if !word.is_empty() {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    let line = crate::syntax::find_target_line_in_source(&content, &word);
+                                    target_range = Range {
+                                        start: Position { line, character: 0 },
+                                        end: Position { line, character: word.len() as u32 },
+                                    };
+                                }
+                            }
+                        }
                         let loc = Location {
                             uri: target_uri,
-                            range: Range {
-                                start: Position {
-                                    line: range.start.line,
-                                    character: range.start.character,
-                                },
-                                end: Position {
-                                    line: range.end.line,
-                                    character: range.end.character,
-                                },
-                            },
+                            range: target_range,
                         };
                         return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
                     }
@@ -2780,6 +2886,14 @@ impl LanguageServer for JlspServer {
             for cls in self.classpath.find_classes_by_simple_name(word).await {
                 if let Some(loc) = self.resolve_external_target_location(&cls, word).await {
                     return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                }
+            }
+            let common_jdk = crate::classpath::find_common_jdk_classes_by_name(word);
+            for fqn in common_jdk {
+                if let Some(cls) = crate::classpath::get_builtin_jdk_class(&fqn) {
+                    if let Some(loc) = self.resolve_external_target_location(&cls, word).await {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                    }
                 }
             }
         }
@@ -3407,62 +3521,105 @@ impl LanguageServer for JlspServer {
         };
 
         let mut actions = Vec::new();
-        let sem = SemanticContext::new(&doc.ast, &self.classpath).await;
+        let sem = SemanticContext::with_indexer(&doc.ast, &self.classpath, Some(&self.indexer)).await;
         let pos = params.range.start;
 
         // 1. Auto import
         if let Some(node) = sem.find_node_at_position(pos.line, pos.character) {
             let word = doc.ast.node_text(&node);
-            let candidates = self.indexer.find_by_simple_name(word).await;
-            let current_pkg = doc.ast.extract_package().unwrap_or_default();
-            let current_imports = doc.ast.extract_imports();
-            let local_class_names: std::collections::HashSet<String> = sem.local_classes.keys().cloned().collect();
-            let (import_pos, need_prefix_newline) = doc.ast.find_import_insertion_position();
+            if !word.is_empty() && word.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+                let current_pkg = doc.ast.extract_package().unwrap_or_default();
+                let current_imports = doc.ast.extract_imports();
+                let local_class_names: std::collections::HashSet<String> = sem.local_classes.keys().cloned().collect();
+                let (import_pos, need_prefix_newline) = doc.ast.find_import_insertion_position();
 
-            for cand in candidates {
-                // Do not prompt/suggest auto-importing current class or classes declared in current file
-                if local_class_names.contains(&cand.simple_name) || local_class_names.contains(&cand.fqn) {
-                    continue;
+                struct CandItem {
+                    simple_name: String,
+                    fqn: String,
+                    package_name: String,
                 }
-                // Do not prompt importing classes belonging to the same package
-                if !current_pkg.is_empty() && cand.class_info.package_name == current_pkg {
-                    continue;
+                let mut candidates: Vec<CandItem> = Vec::new();
+                let mut seen_fqns = std::collections::HashSet::new();
+
+                // 1) Workspace indexer
+                for sym in self.indexer.find_by_simple_name(word).await {
+                    if seen_fqns.insert(sym.fqn.clone()) {
+                        candidates.push(CandItem {
+                            simple_name: sym.simple_name,
+                            fqn: sym.fqn,
+                            package_name: sym.class_info.package_name,
+                        });
+                    }
                 }
-                // Do not import already imported or java.lang classes
-                if current_imports.iter().any(|i| i == &cand.fqn) || cand.fqn.starts_with("java.lang.") {
-                    continue;
+
+                // 2) Classpath (libraries / dependencies / loaded jars)
+                for cls in self.classpath.find_classes_by_simple_name(word).await {
+                    if seen_fqns.insert(cls.fqn.clone()) {
+                        candidates.push(CandItem {
+                            simple_name: cls.simple_name.clone(),
+                            fqn: cls.fqn.clone(),
+                            package_name: cls.package_name.clone(),
+                        });
+                    }
                 }
 
-                let import_stmt = if need_prefix_newline {
-                    format!("\nimport {};\n", cand.fqn)
-                } else {
-                    format!("import {};\n", cand.fqn)
-                };
+                // 3) Common JDK classes
+                for jdk_fqn in crate::classpath::find_common_jdk_classes_by_name(word) {
+                    if seen_fqns.insert(jdk_fqn.clone()) {
+                        let pkg = jdk_fqn.rsplit_once('.').map(|(p, _)| p.to_string()).unwrap_or_default();
+                        candidates.push(CandItem {
+                            simple_name: word.to_string(),
+                            fqn: jdk_fqn,
+                            package_name: pkg,
+                        });
+                    }
+                }
 
-                let edit = TextEdit {
-                    range: Range {
-                        start: Position { line: import_pos.line, character: import_pos.character },
-                        end: Position { line: import_pos.line, character: import_pos.character },
-                    },
-                    new_text: import_stmt,
-                };
+                for cand in candidates {
+                    // Do not prompt/suggest auto-importing current class or classes declared in current file
+                    if local_class_names.contains(&cand.simple_name) || local_class_names.contains(&cand.fqn) {
+                        continue;
+                    }
+                    // Do not prompt importing classes belonging to the same package
+                    if !current_pkg.is_empty() && cand.package_name == current_pkg {
+                        continue;
+                    }
+                    // Do not import already imported or java.lang classes
+                    if current_imports.iter().any(|i| i == &cand.fqn) || cand.fqn.starts_with("java.lang.") {
+                        continue;
+                    }
 
-                let mut changes = HashMap::new();
-                changes.insert(uri.clone(), vec![edit]);
+                    let import_stmt = if need_prefix_newline {
+                        format!("\nimport {};\n", cand.fqn)
+                    } else {
+                        format!("import {};\n", cand.fqn)
+                    };
 
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Import '{}' ({})", cand.simple_name, cand.fqn),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    diagnostics: None,
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    command: None,
-                    is_preferred: Some(true),
-                    disabled: None,
-                    data: None,
-                }));
+                    let edit = TextEdit {
+                        range: Range {
+                            start: Position { line: import_pos.line, character: import_pos.character },
+                            end: Position { line: import_pos.line, character: import_pos.character },
+                        },
+                        new_text: import_stmt,
+                    };
+
+                    let mut changes = HashMap::new();
+                    changes.insert(uri.clone(), vec![edit]);
+
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Import '{}' ({})", cand.simple_name, cand.fqn),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        command: None,
+                        is_preferred: Some(true),
+                        disabled: None,
+                        data: None,
+                    }));
+                }
             }
         }
 
@@ -3473,7 +3630,16 @@ impl LanguageServer for JlspServer {
         if let Some(prefix) = prefix_opt {
             organize_text.push_str(&prefix);
         }
-        for imp in organized {
+        let mut had_static = false;
+        for imp in &organized {
+            let is_static = imp.starts_with("static ");
+            if !is_static && had_static {
+                organize_text.push('\n');
+                had_static = false;
+            }
+            if is_static {
+                had_static = true;
+            }
             organize_text.push_str(&format!("import {};\n", imp));
         }
 
@@ -3956,10 +4122,13 @@ impl LanguageServer for JlspServer {
         }
 
         // 16. Remove unused import QuickFix
-        for (imp_name, imp_range) in doc.ast.find_unused_imports() {
+        let unused_imports = doc.ast.find_unused_imports();
+        let mut has_cursor_or_diag_on_unused = false;
+        for (imp_name, imp_range) in &unused_imports {
             if (pos.line >= imp_range.start.line && pos.line <= imp_range.end.line)
                 || params.context.diagnostics.iter().any(|d| d.range.start.line == imp_range.start.line)
             {
+                has_cursor_or_diag_on_unused = true;
                 let mut rm_changes = HashMap::new();
                 rm_changes.insert(
                     uri.clone(),
@@ -3986,6 +4155,37 @@ impl LanguageServer for JlspServer {
                     data: None,
                 }));
             }
+        }
+
+        if has_cursor_or_diag_on_unused && unused_imports.len() > 1 {
+            let mut all_edits: Vec<TextEdit> = unused_imports
+                .iter()
+                .map(|(_, r)| TextEdit {
+                    range: Range {
+                        start: Position { line: r.start.line, character: 0 },
+                        end: Position { line: r.end.line + 1, character: 0 },
+                    },
+                    new_text: String::new(),
+                })
+                .collect();
+            all_edits.sort_by(|a, b| b.range.start.line.cmp(&a.range.start.line));
+
+            let mut all_changes = HashMap::new();
+            all_changes.insert(uri.clone(), all_edits);
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Remove all unused imports".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: None,
+                edit: Some(WorkspaceEdit {
+                    changes: Some(all_changes),
+                    ..Default::default()
+                }),
+                command: None,
+                is_preferred: Some(false),
+                disabled: None,
+                data: None,
+            }));
         }
 
         // 17. Remove unused variable QuickFix
@@ -4780,7 +4980,7 @@ impl LanguageServer for JlspServer {
             None => return Ok(None),
         };
 
-        let sem = SemanticContext::new(&doc.ast, &self.classpath).await;
+        let sem = SemanticContext::with_indexer(&doc.ast, &self.classpath, Some(&self.indexer)).await;
         let current_pkg = doc.ast.extract_package();
         let current_imports = doc.ast.extract_imports();
 
@@ -7168,6 +7368,12 @@ public class CleanupTest {
         });
         assert!(imp_action.is_some(), "Should offer 'Remove unused import', got: {:?}", ca_imp);
 
+        let remove_all = ca_imp.iter().find(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => ca.title == "Remove all unused imports",
+            _ => false,
+        });
+        assert!(remove_all.is_some(), "Should offer 'Remove all unused imports', got: {:?}", ca_imp);
+
         // 2. Check unused variable QuickFix on 'int unusedLocal = 123;' (line 6, char 14)
         let ca_var = server.code_action(CodeActionParams {
             text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
@@ -7203,6 +7409,40 @@ public class CleanupTest {
         } else {
             panic!("Expected CompletionResponse::Array");
         }
+    }
+
+    #[tokio::test]
+    async fn test_auto_import_missing_jdk_class() {
+        let (service, _) = tower_lsp::LspService::new(JlspServer::new);
+        let server = service.inner();
+
+        let code = r#"package com.example;
+
+public class TestImport {
+    public void demo() {
+        UUID id = null;
+    }
+}"#;
+        let uri = Url::parse("file:///TestImport.java").unwrap();
+        server.documents.insert(uri.clone(), DocumentState {
+            text: Arc::new(code.to_string()),
+            ast: JavaAst::parse(Arc::new(code.to_string())).unwrap(),
+        });
+
+        // Request code actions on "UUID" (line 4, character 9)
+        let ca_resp = server.code_action(CodeActionParams {
+            text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+            range: Range { start: Position { line: 4, character: 9 }, end: Position { line: 4, character: 9 } },
+            context: tower_lsp::lsp_types::CodeActionContext { diagnostics: vec![], only: None, trigger_kind: None },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.unwrap().expect("code action response");
+
+        let import_uuid = ca_resp.iter().find(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => ca.title.contains("Import 'UUID' (java.util.UUID)"),
+            _ => false,
+        });
+        assert!(import_uuid.is_some(), "Should offer auto-import for java.util.UUID, got: {:?}", ca_resp);
     }
 
     #[tokio::test]
@@ -8330,6 +8570,8 @@ public class Main {
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Main {
     public void run() {
@@ -8337,6 +8579,12 @@ public class Main {
         ArrayList<String> list = new ArrayList<>();
         Collection<String> col = list;
         boolean created = f.createNewFile();
+        String title = "demo";
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicBoolean flag = new AtomicBoolean(false);
+        latch.countDown();
+        boolean val = flag.get();
+        int len = title.length();
     }
 }
 "#;
@@ -8377,11 +8625,41 @@ public class Main {
             assert!(loc.uri.as_str().ends_with("ArrayList.java"), "Target must be ArrayList.java: {}", loc.uri);
         }
 
-        // 3. Goto definition on `File` identifier in code (line 7, col 8)
+        // 3. Goto definition on `import java.util.concurrent.CountDownLatch;` (line 4, col 25)
+        let resp_import_latch = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 4, character: 25 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_import_latch.is_some(), "Should resolve definition on import CountDownLatch");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_import_latch {
+            assert!(loc.uri.as_str().ends_with("CountDownLatch.java"), "Target must be CountDownLatch.java: {}", loc.uri);
+        }
+
+        // 4. Goto definition on `import java.util.concurrent.atomic.AtomicBoolean;` (line 5, col 30)
+        let resp_import_atomic = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 5, character: 30 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_import_atomic.is_some(), "Should resolve definition on import AtomicBoolean");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_import_atomic {
+            assert!(loc.uri.as_str().ends_with("AtomicBoolean.java"), "Target must be AtomicBoolean.java: {}", loc.uri);
+        }
+
+        // 5. Goto definition on `File` identifier in code (line 9, col 8)
         let resp_file_type = server.goto_definition(GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-                position: Position { line: 7, character: 8 },
+                position: Position { line: 9, character: 8 },
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
@@ -8392,19 +8670,150 @@ public class Main {
             assert!(loc.uri.as_str().ends_with("File.java"));
         }
 
-        // 4. Goto definition on `f.createNewFile()` (line 10, col 28)
-        let resp_method = server.goto_definition(GotoDefinitionParams {
+        // 6. Goto definition on `String` identifier in code (line 13, col 8)
+        let resp_string_type = server.goto_definition(GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-                position: Position { line: 10, character: 28 },
+                position: Position { line: 13, character: 8 },
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         }).await.expect("goto_definition succeeds");
 
-        assert!(resp_method.is_some(), "Should resolve definition on f.createNewFile()");
-        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_method {
-            assert!(loc.uri.as_str().ends_with("File.java"));
+        assert!(resp_string_type.is_some(), "Should resolve definition on String type in code");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_string_type {
+            assert!(loc.uri.as_str().ends_with("String.java"), "Target must be String.java: {}", loc.uri);
+        }
+
+        // 7. Goto definition on `CountDownLatch` identifier in code (line 14, col 8)
+        let resp_latch_type = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 14, character: 8 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_latch_type.is_some(), "Should resolve definition on CountDownLatch type in code");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_latch_type {
+            assert!(loc.uri.as_str().ends_with("CountDownLatch.java"), "Target must be CountDownLatch.java: {}", loc.uri);
+        }
+
+        // 8. Goto definition on `AtomicBoolean` identifier in code (line 15, col 8)
+        let resp_atomic_type = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 15, character: 8 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_atomic_type.is_some(), "Should resolve definition on AtomicBoolean type in code");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_atomic_type {
+            assert!(loc.uri.as_str().ends_with("AtomicBoolean.java"), "Target must be AtomicBoolean.java: {}", loc.uri);
+        }
+
+        // 9. Goto definition on `latch.countDown()` (line 16, col 16)
+        let resp_countdown = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 16, character: 16 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_countdown.is_some(), "Should resolve definition on latch.countDown()");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_countdown {
+            assert!(loc.uri.as_str().ends_with("CountDownLatch.java"));
+        }
+
+        // 10. Goto definition on `flag.get()` (line 17, col 27)
+        let resp_flag_get = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 17, character: 27 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_flag_get.is_some(), "Should resolve definition on flag.get()");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_flag_get {
+            assert!(loc.uri.as_str().ends_with("AtomicBoolean.java"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_goto_definition_on_jdk_types_without_preindexed_jdk() {
+        let (service, _) = tower_lsp::LspService::new(JlspServer::new);
+        let server = service.inner();
+        // NOTE: We deliberately DO NOT call server.classpath.add_jdk_home() here!
+        // This validates instant zero-delay resolution on JDK core types and imports.
+
+        let code = r#"package com.demo;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class Demo {
+    public void test() {
+        String msg = "hello";
+        CountDownLatch latch = new CountDownLatch(5);
+        AtomicBoolean flag = new AtomicBoolean(true);
+    }
+}
+"#;
+        let uri = Url::parse("file:///Demo.java").unwrap();
+        server.documents.insert(uri.clone(), DocumentState {
+            text: Arc::new(code.to_string()),
+            ast: JavaAst::parse(Arc::new(code.to_string())).unwrap(),
+        });
+
+        // 1. Definition on String (line 6, col 8)
+        let resp_string = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 6, character: 8 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_string.is_some(), "String must resolve even without pre-indexed JDK");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_string {
+            assert!(loc.uri.as_str().ends_with("String.java"));
+        }
+
+        // 2. Definition on CountDownLatch import (line 1, col 25)
+        let resp_latch_imp = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 1, character: 25 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_latch_imp.is_some(), "CountDownLatch import must resolve");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_latch_imp {
+            assert!(loc.uri.as_str().ends_with("CountDownLatch.java"));
+        }
+
+        // 3. Definition on AtomicBoolean in code (line 8, col 8)
+        let resp_atomic = server.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 8, character: 8 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await.expect("goto_definition succeeds");
+
+        assert!(resp_atomic.is_some(), "AtomicBoolean must resolve");
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp_atomic {
+            assert!(loc.uri.as_str().ends_with("AtomicBoolean.java"));
         }
     }
 
