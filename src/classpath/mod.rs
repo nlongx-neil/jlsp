@@ -4,21 +4,123 @@ pub mod decompiler;
 pub mod descriptor;
 pub mod jimage;
 
+pub mod store;
+
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::classpath::class_reader::parse_jar_file;
+use crate::classpath::store::{simple_name_of, ArchivedStore, ClassStore};
 use crate::model::{ClassInfo, ClassKind, MethodInfo, TypeSignature};
+
+/// Upper bound on materialized `ClassInfo` views kept for hot lookups.
+const VIEW_CACHE_CAPACITY: usize = 2048;
+/// Upper bound on methods returned by a classpath-wide name search.
+const METHOD_SEARCH_LIMIT: usize = 256;
+
+/// Names-only index of classes whose jar has not been parsed yet (lazy loading).
+/// Keeps one `Arc<str>` per fqn and one shared `Arc<str>` per jar path.
+#[derive(Default)]
+struct PendingIndex {
+    /// fqn -> jar path
+    by_fqn: HashMap<Arc<str>, Arc<str>>,
+    /// simple name -> fqns
+    by_simple: HashMap<Arc<str>, Vec<Arc<str>>>,
+}
+
+impl PendingIndex {
+    fn insert(&mut self, fqn: Arc<str>, path: Arc<str>) {
+        if self.by_fqn.contains_key(&fqn) {
+            return;
+        }
+        self.by_simple
+            .entry(Arc::from(simple_name_of(&fqn)))
+            .or_default()
+            .push(fqn.clone());
+        self.by_fqn.insert(fqn, path);
+    }
+
+    fn remove_jar(&mut self, path: &str) {
+        let fqns: Vec<Arc<str>> = self
+            .by_fqn
+            .iter()
+            .filter(|(_, p)| &***p == path)
+            .map(|(f, _)| f.clone())
+            .collect();
+        for fqn in fqns {
+            self.by_fqn.remove(&fqn);
+            let simple = simple_name_of(&fqn);
+            if let Some(list) = self.by_simple.get_mut(simple) {
+                list.retain(|f| f != &fqn);
+                if list.is_empty() {
+                    self.by_simple.remove(simple);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, fqn: &str) -> bool {
+        self.by_fqn.contains_key(fqn)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_fqn.is_empty()
+    }
+
+    fn has_jar(&self, jar_path: &str) -> bool {
+        self.by_fqn.values().any(|p| &**p == jar_path)
+    }
+
+    fn len(&self) -> usize {
+        self.by_fqn.len()
+    }
+}
+
+#[derive(Default)]
+struct ViewCache {
+    map: HashMap<u32, Arc<ClassInfo>>,
+    order: std::collections::VecDeque<u32>,
+}
+
+impl ViewCache {
+    fn get(&self, idx: u32) -> Option<Arc<ClassInfo>> {
+        self.map.get(&idx).cloned()
+    }
+
+    fn insert(&mut self, idx: u32, view: Arc<ClassInfo>) {
+        if self.map.insert(idx, view).is_none() {
+            self.order.push_back(idx);
+        }
+        while self.order.len() > VIEW_CACHE_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
 
 #[derive(Default)]
 pub struct ClasspathRegistry {
-    /// Mapping from FQN (e.g. "java.lang.String") to ClassInfo
-    classes: RwLock<HashMap<String, Arc<ClassInfo>>>,
-    /// Mapping from Simple Name (e.g. "String") to list of ClassInfos
-    simple_name_index: RwLock<HashMap<String, Vec<Arc<ClassInfo>>>>,
+    /// Compact, pooled storage for every classpath class.
+    store: RwLock<ClassStore>,
+    /// On-demand materialized views of recently used classes.
+    views: Mutex<ViewCache>,
+    /// Classes known by name whose jar has not been parsed yet (lazy loading).
+    pending: RwLock<PendingIndex>,
+    /// Serializes on-demand jar loads.
+    lazy_lock: tokio::sync::Mutex<()>,
+    /// Workspace archive used as a last-resort source for lazy loads.
+    fallback_archive: RwLock<Option<std::path::PathBuf>>,
+    /// Decoded fallback archive, memoized so repeated misses stay cheap.
+    fallback_store: tokio::sync::OnceCell<ClassStore>,
     /// Mapping from FQN to list of source paths/jars (only populated if conflicts exist)
     origins: RwLock<HashMap<String, Vec<String>>>,
     /// Set of already loaded jar paths (avoid duplicate scanning & indexing)
@@ -29,81 +131,231 @@ pub struct ClasspathRegistry {
 
 impl ClasspathRegistry {
     pub fn new() -> Self {
-        Self {
-            classes: RwLock::new(HashMap::new()),
-            simple_name_index: RwLock::new(HashMap::new()),
-            origins: RwLock::new(HashMap::new()),
-            loaded_jars: RwLock::new(std::collections::HashSet::new()),
-            jdk_home: RwLock::new(None),
-        }
+        Self::default()
     }
 
     pub async fn register_class(&self, class: ClassInfo) {
         self.register_classes(vec![class]).await;
     }
 
-    /// Batch register multiple classes with minimal lock contention
+    /// Batch register multiple classes, interning them into the compact store.
     pub async fn register_classes(&self, new_classes: Vec<ClassInfo>) {
         if new_classes.is_empty() {
             return;
         }
 
-        let mut classes_guard = self.classes.write().await;
-        let mut s_idx_guard = self.simple_name_index.write().await;
-        let mut origins_guard = self.origins.write().await;
+        let archive = ArchivedStore::from_classes(&new_classes);
+        self.append_archive(archive).await;
 
-        for class in new_classes {
-            let fqn = class.fqn.clone();
-            let simple_name = class.simple_name.clone();
-            let arc_class = Arc::new(class);
-
-            let old = classes_guard.insert(fqn.clone(), arc_class.clone());
-
-            // De-duplicate simple_name_index and store Arc<ClassInfo> directly (0 redundant FQN strings)
-            let s_list = s_idx_guard.entry(simple_name).or_default();
-            if let Some(pos) = s_list.iter().position(|c| c.fqn == fqn) {
-                s_list[pos] = arc_class.clone();
-            } else {
-                s_list.push(arc_class.clone());
+        // Only track origins when a REAL multi-jar conflict occurs.
+        let mut conflicts: Vec<(String, String, String)> = Vec::new();
+        {
+            let store = self.store.read().await;
+            for class in &new_classes {
+                let Some(idx) = store.class_index(&class.fqn) else {
+                    continue;
+                };
+                let Some(prev_path) = store.class_source_path(idx) else {
+                    continue;
+                };
+                let Some(cur_path) = class.source_path.as_deref() else {
+                    continue;
+                };
+                if prev_path != cur_path {
+                    conflicts.push((class.fqn.clone(), prev_path.to_string(), cur_path.to_string()));
+                }
             }
-
-            // Only track origins when a REAL multi-jar conflict occurs (saving ~99% origin heap memory)
-            if let Some(prev) = old {
-                if let (Some(prev_sp), Some(cur_sp)) = (&prev.source_path, &arc_class.source_path) {
-                    if prev_sp != cur_sp {
-                        let list = origins_guard.entry(fqn).or_default();
-                        if !list.contains(prev_sp) {
-                            list.push(prev_sp.clone());
-                        }
-                        if !list.contains(cur_sp) {
-                            list.push(cur_sp.clone());
-                        }
-                    }
+        }
+        if !conflicts.is_empty() {
+            let mut origins = self.origins.write().await;
+            for (fqn, prev_path, cur_path) in conflicts {
+                let list = origins.entry(fqn).or_default();
+                if !list.contains(&prev_path) {
+                    list.push(prev_path);
+                }
+                if !list.contains(&cur_path) {
+                    list.push(cur_path);
                 }
             }
         }
     }
 
-    pub async fn get_class_origins(&self, fqn: &str) -> Vec<String> {
-        let origins = self.origins.read().await;
-        if let Some(list) = origins.get(fqn) {
-            return list.clone();
+    async fn append_archive(&self, archive: ArchivedStore) {
+        self.store.write().await.append_archive(archive);
+        self.views.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Materialize (and cache) a class view for a store index.
+    async fn materialized(&self, idx: u32) -> Arc<ClassInfo> {
+        if let Some(view) = self.views.lock().unwrap_or_else(|e| e.into_inner()).get(idx) {
+            return view;
         }
-        let classes = self.classes.read().await;
-        if let Some(cls) = classes.get(fqn) {
-            if let Some(ref sp) = cls.source_path {
-                return vec![sp.clone()];
+        let view = Arc::new(self.store.read().await.materialize(idx));
+        self.views
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(idx, view.clone());
+        view
+    }
+
+    /// Register class names without loading their metadata (lazy jar indexing).
+    async fn register_pending(&self, jar_path: &str, fqns: Vec<String>) {
+        if fqns.is_empty() {
+            return;
+        }
+        let path: Arc<str> = Arc::from(jar_path);
+        let mut pending = self.pending.write().await;
+        for fqn in fqns {
+            pending.insert(Arc::from(fqn.as_str()), path.clone());
+        }
+    }
+
+    /// Load a pending jar's full metadata on demand. Idempotent; the jar's
+    /// pending entries are dropped afterwards whether or not loading succeeded.
+    async fn ensure_jar_loaded(&self, jar_path: &str) {
+        if !self.pending.read().await.has_jar(jar_path) {
+            return;
+        }
+        let _guard = self.lazy_lock.lock().await;
+        // Re-check: another task may have loaded this jar while we waited.
+        if !self.pending.read().await.has_jar(jar_path) {
+            return;
+        }
+
+        let p = std::path::Path::new(jar_path);
+        let mut appended = false;
+
+        // 1. Global per-jar disk cache
+        if let Some(key) = crate::classpath::cache::compute_jar_cache_key(p) {
+            let cf = crate::classpath::cache::global_jar_cache_dir().join(key);
+            if cf.exists() {
+                if let Ok(Some(archive)) = crate::classpath::cache::load_store_archive_file(&cf) {
+                    if archive.class_count() > 0 {
+                        self.append_archive(archive).await;
+                        appended = true;
+                    }
+                }
+                if !appended {
+                    // Legacy (unpooled) per-jar cache: decode, re-intern, rewrite once.
+                    if let Ok(classes) = crate::classpath::cache::load_archive_file(&cf) {
+                        if !classes.is_empty() {
+                            let archive = ArchivedStore::from_classes(&classes);
+                            self.register_classes(classes).await;
+                            let _ = crate::classpath::cache::save_store_archive_file(&cf, &archive);
+                            appended = true;
+                        }
+                    }
+                }
             }
+        }
+
+        // 2. Parse the jar itself
+        if !appended && p.exists() {
+            if let Ok(parsed) = parse_jar_file(p) {
+                let archive = ArchivedStore::from_classes(&parsed);
+                drop(parsed);
+                if let Some(key) = crate::classpath::cache::compute_jar_cache_key(p) {
+                    let cf = crate::classpath::cache::global_jar_cache_dir().join(key);
+                    if let Some(parent) = cf.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = crate::classpath::cache::save_store_archive_file(&cf, &archive);
+                }
+                self.append_archive(archive).await;
+                appended = true;
+            }
+        }
+
+        // 3. Last resort: the workspace archive recorded these classes.
+        // The decoded archive is memoized so thousands of misses (e.g. stale
+        // paths) never trigger a full decode per jar.
+        if !appended {
+            let fallback = self.fallback_archive.read().await.clone();
+            if let Some(fb) = fallback {
+                let tmp = self
+                    .fallback_store
+                    .get_or_try_init(|| async {
+                        let archive = crate::classpath::cache::load_store_archive_file(&fb)?
+                            .ok_or_else(|| "not a pooled archive".to_string())?;
+                        let mut tmp = ClassStore::new();
+                        tmp.append_archive(archive);
+                        Ok::<ClassStore, String>(tmp)
+                    })
+                    .await;
+                if let Ok(tmp) = tmp {
+                    let filtered = tmp.export(|_, sp| sp == Some(jar_path));
+                    if filtered.class_count() > 0 {
+                        self.append_archive(filtered).await;
+                        appended = true;
+                    }
+                }
+            }
+        }
+
+        if appended {
+            info!("Lazily loaded classes from {}", jar_path);
+        }
+        self.pending.write().await.remove_jar(jar_path);
+    }
+
+    /// Make the class with this fqn available in the store, lazily loading the
+    /// jar that contains it when necessary.
+    async fn ensure_class_loaded(&self, fqn: &str) {
+        if self.store.read().await.contains(fqn) {
+            return;
+        }
+        let jar = { self.pending.read().await.by_fqn.get(fqn).cloned() };
+        if let Some(jar) = jar {
+            self.ensure_jar_loaded(&jar).await;
+        }
+    }
+
+    /// Eagerly load every pending jar. Used by whole-classpath fuzzy queries
+    /// whose result set must match a fully indexed classpath.
+    async fn ensure_all_pending_loaded(&self) {
+        loop {
+            let next = { self.pending.read().await.by_fqn.values().next().cloned() };
+            match next {
+                Some(jar) => self.ensure_jar_loaded(&jar).await,
+                None => break,
+            }
+        }
+    }
+
+    pub async fn get_class_origins(&self, fqn: &str) -> Vec<String> {
+        {
+            let origins = self.origins.read().await;
+            if let Some(list) = origins.get(fqn) {
+                return list.clone();
+            }
+        }
+        {
+            let store = self.store.read().await;
+            if let Some(idx) = store.class_index(fqn) {
+                if let Some(path) = store.class_source_path(idx) {
+                    return vec![path.to_string()];
+                }
+            }
+        }
+        let pending = self.pending.read().await;
+        if let Some(path) = pending.by_fqn.get(fqn) {
+            return vec![path.to_string()];
         }
         Vec::new()
     }
 
     pub async fn get_class(&self, fqn: &str) -> Option<Arc<ClassInfo>> {
-        let classes = self.classes.read().await;
-        if let Some(cls) = classes.get(fqn) {
-            return Some(cls.clone());
+        let idx = { self.store.read().await.class_index(fqn) };
+        if let Some(idx) = idx {
+            return Some(self.materialized(idx).await);
         }
-        drop(classes);
+
+        // Lazily load the jar that contains this class
+        self.ensure_class_loaded(fqn).await;
+        let idx = { self.store.read().await.class_index(fqn) };
+        if let Some(idx) = idx {
+            return Some(self.materialized(idx).await);
+        }
 
         if let Some(builtin) = get_builtin_framework_class(fqn) {
             return Some(Arc::new(builtin));
@@ -116,10 +368,53 @@ impl ClasspathRegistry {
         None
     }
 
+    /// Like [`get_class`], but only consults real indexed data (class store +
+    /// lazily loaded jars) and never synthesizes builtin framework/JDK stubs.
+    ///
+    /// Use this where Java resolution semantics require a nonexistent class to
+    /// stay unresolved — e.g. same-package or wildcard-import candidates. A
+    /// synthesized stub would otherwise pretend that `org.apache.commons.lang.String`
+    /// exists and shadow the real `java.lang.String`, and goto-definition would
+    /// then decompile the empty stub into a bogus `.java` file.
+    pub async fn get_class_strict(&self, fqn: &str) -> Option<Arc<ClassInfo>> {
+        let idx = { self.store.read().await.class_index(fqn) };
+        if let Some(idx) = idx {
+            return Some(self.materialized(idx).await);
+        }
+        self.ensure_class_loaded(fqn).await;
+        let idx = { self.store.read().await.class_index(fqn) };
+        if let Some(idx) = idx {
+            return Some(self.materialized(idx).await);
+        }
+        None
+    }
+
     pub async fn find_classes_by_simple_name(&self, simple_name: &str) -> Vec<Arc<ClassInfo>> {
-        let s_idx = self.simple_name_index.read().await;
-        let mut res = s_idx.get(simple_name).cloned().unwrap_or_default();
-        drop(s_idx);
+        // Load any pending jars containing classes with this simple name
+        let jars: Vec<Arc<str>> = {
+            let pending = self.pending.read().await;
+            let mut set = std::collections::HashSet::new();
+            let mut jars = Vec::new();
+            if let Some(fqns) = pending.by_simple.get(simple_name) {
+                for fqn in fqns {
+                    if let Some(path) = pending.by_fqn.get(fqn) {
+                        if set.insert(path.clone()) {
+                            jars.push(path.clone());
+                        }
+                    }
+                }
+            }
+            jars
+        };
+        for jar in jars {
+            self.ensure_jar_loaded(&jar).await;
+        }
+
+        let idxs = { self.store.read().await.simple_class_indices(simple_name) };
+        let mut res = Vec::with_capacity(idxs.len());
+        for idx in idxs {
+            res.push(self.materialized(idx).await);
+        }
 
         if res.is_empty() {
             if let Some(builtin) = get_builtin_framework_class_by_simple_name(simple_name) {
@@ -134,69 +429,77 @@ impl ClasspathRegistry {
         res
     }
 
-    pub async fn all_classes(&self) -> Vec<Arc<ClassInfo>> {
-        let classes = self.classes.read().await;
-        classes.values().cloned().collect()
+    /// Methods with a matching name across the classpath (used by signature help).
+    /// Loads every pending jar first so results match a fully indexed classpath.
+    pub async fn find_methods_by_name(&self, name: &str) -> Vec<MethodInfo> {
+        self.ensure_all_pending_loaded().await;
+        self.store
+            .read()
+            .await
+            .search_methods(name, METHOD_SEARCH_LIMIT)
+    }
+
+    /// Classes directly extending/implementing `target` (fqn or simple name).
+    /// Loads every pending jar first so results match a fully indexed classpath.
+    pub async fn find_subclasses(&self, target: &str) -> Vec<Arc<ClassInfo>> {
+        self.ensure_all_pending_loaded().await;
+        let idxs = { self.store.read().await.subclass_indices(target) };
+        let mut res = Vec::with_capacity(idxs.len());
+        for idx in idxs {
+            res.push(self.materialized(idx).await);
+        }
+        res
+    }
+
+    /// `(simple_name, fqn)` pairs for class-name completion, without materializing
+    /// classes. Includes pending (not yet parsed) classes so completion coverage
+    /// matches a fully indexed classpath.
+    pub async fn class_summaries(&self) -> Vec<(String, String)> {
+        let mut out = { self.store.read().await.summaries() };
+        let seen: std::collections::HashSet<String> =
+            out.iter().map(|(_, f)| f.clone()).collect();
+        let pending = self.pending.read().await;
+        for fqn in pending.by_fqn.keys() {
+            if !seen.contains(&**fqn) {
+                out.push((simple_name_of(fqn).to_string(), fqn.to_string()));
+            }
+        }
+        out
     }
 
     pub async fn has_classes(&self) -> bool {
-        let classes = self.classes.read().await;
-        !classes.is_empty()
+        if !self.pending.read().await.is_empty() {
+            return true;
+        }
+        !self.store.read().await.is_empty()
     }
 
     pub async fn has_jdk_loaded(&self) -> bool {
-        let classes = self.classes.read().await;
-        classes.contains_key("java.lang.Object")
-            || classes.contains_key("java.util.List")
-            || classes.contains_key("java.io.File")
+        for fqn in ["java.lang.Object", "java.util.List", "java.io.File"] {
+            if self.store.read().await.contains(fqn) || self.pending.read().await.contains(fqn) {
+                return true;
+            }
+        }
+        false
     }
 
-    /// Load all classes from a jar file (with global multi-project disk caching)
+    /// Index a jar's class names (zip directory scan only, no class parsing).
+    /// Full metadata is loaded on first actual use via [`Self::ensure_jar_loaded`].
     pub async fn add_jar<P: AsRef<Path>>(&self, jar_path: P) -> Result<usize, String> {
         let p = jar_path.as_ref();
         let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         {
             let mut loaded = self.loaded_jars.write().await;
             if !loaded.insert(canonical) {
-                // Jar already loaded into classpath, skip redundant parsing & duplicate memory allocation
+                // Jar already indexed, skip redundant scanning
                 return Ok(0);
             }
         }
 
-        let path_str = p.display().to_string();
-
-        let global_cache_file = crate::classpath::cache::compute_jar_cache_key(p).map(|key| {
-            let dir = crate::classpath::cache::global_jar_cache_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            dir.join(key)
-        });
-
-        // 1. Try fast warm-load from global jar cache
-        if let Some(ref cf) = global_cache_file {
-            if cf.exists() {
-                if let Ok(classes) = crate::classpath::cache::load_archive_file(cf) {
-                    if !classes.is_empty() {
-                        let count = classes.len();
-                        self.register_classes(classes).await;
-                        info!("Fast-loaded {} classes for {} from global jar cache", count, path_str);
-                        return Ok(count);
-                    }
-                }
-            }
-        }
-
-        // 2. Cache miss: parse raw jar file
-        info!("Loading jar: {}", path_str);
-        let parsed = parse_jar_file(p)?;
-        let count = parsed.len();
-
-        // 3. Persist to global jar cache for instant cross-project warm starts
-        if let Some(ref cf) = global_cache_file {
-            let _ = crate::classpath::cache::save_archive_file(cf, &parsed);
-        }
-
-        self.register_classes(parsed).await;
-        info!("Loaded and cached {} classes from {}", count, path_str);
+        let path_str = p.to_string_lossy().to_string();
+        let fqns = crate::classpath::class_reader::scan_jar_class_names(p)?;
+        let count = fqns.len();
+        self.register_pending(&path_str, fqns).await;
         Ok(count)
     }
 
@@ -262,6 +565,15 @@ impl ClasspathRegistry {
                 metadata.len().hash(&mut hasher);
                 if let Ok(mtime) = metadata.modified() {
                     mtime.hash(&mut hasher);
+                }
+            }
+            // Mix in the first 64 KiB of the modules image so an in-place JDK
+            // update that preserves size/mtime still invalidates the cache.
+            if let Ok(mut f) = std::fs::File::open(&modules_path) {
+                use std::io::Read;
+                let mut head = [0u8; 64 * 1024];
+                if let Ok(n) = f.read(&mut head) {
+                    head[..n].hash(&mut hasher);
                 }
             }
             let cache_key = format!("jdk_v3_{:016x}.bin.zst", hasher.finish());
@@ -347,33 +659,147 @@ impl ClasspathRegistry {
     /// Persist project dependency classes (excluding JDK classes) to workspace disk cache
     pub async fn save_workspace_cache<P: AsRef<Path>>(&self, cache_file: P) -> Result<usize, String> {
         let p = cache_file.as_ref();
-        let classes = self.classes.read().await;
-        let project_classes: Vec<&ClassInfo> = classes
-            .values()
-            .map(|c| c.as_ref())
-            .filter(|c| {
-                if let Some(ref sp) = c.source_path {
-                    // Only save classes that came from project jars (avoid duplicating JDK in workspace cache)
-                    sp.ends_with(".jar") && !sp.contains("rt.jar") && !sp.contains("classes.jar")
-                } else {
-                    false
+        let archive = {
+            let store = self.store.read().await;
+            store.export(|_, path| match path {
+                // Only save classes that came from project jars (avoid duplicating JDK in workspace cache)
+                Some(path) => {
+                    path.ends_with(".jar") && !path.contains("rt.jar") && !path.contains("classes.jar")
                 }
+                None => false,
             })
-            .collect();
-        let count = project_classes.len();
+        };
+        let count = archive.class_count();
 
-        crate::classpath::cache::save_archive_file_from_refs(p, project_classes, count)?;
+        crate::classpath::cache::save_store_archive_file(p, &archive)?;
+
+        // Name index for lazy startup: pending entries + everything already loaded.
+        // Only jar paths qualify: non-jar source paths (e.g. JDK temp extraction
+        // dirs) cannot be re-fetched lazily and would just pollute the index.
+        let mut entries: Vec<(String, String)> = Vec::new();
+        {
+            let pending = self.pending.read().await;
+            entries.reserve(pending.len());
+            for (fqn, path) in &pending.by_fqn {
+                if path.ends_with(".jar") {
+                    entries.push((fqn.to_string(), path.to_string()));
+                }
+            }
+        }
+        {
+            let store = self.store.read().await;
+            for (fqn, path) in store.fqn_path_pairs() {
+                if let Some(path) = path {
+                    if path.ends_with(".jar") {
+                        entries.push((fqn, path));
+                    }
+                }
+            }
+        }
+        let names_file = p.with_file_name("index.names.zst");
+        let _ = crate::classpath::cache::save_names_file(&names_file, &entries);
+        *self.fallback_archive.write().await = Some(p.to_path_buf());
+
         info!("Saved {} project dependency classes to workspace index cache: {:?}", count, p);
         Ok(count)
+    }
+
+    /// Lazy workspace startup: restore only the `(fqn, jar)` name index from
+    /// disk; class metadata is loaded on demand. Returns the number of indexed
+    /// class names.
+    pub async fn load_workspace_index<P: AsRef<Path>>(&self, cache_file: P) -> Result<usize, String> {
+        let cache_file = cache_file.as_ref();
+        let names_file = cache_file.with_file_name("index.names.zst");
+
+        if let Some(entries) = crate::classpath::cache::load_names_file(&names_file)? {
+            let count = entries.len();
+            self.register_pending_entries(entries).await;
+            *self.fallback_archive.write().await = Some(cache_file.to_path_buf());
+            self.mark_pending_jars_loaded().await;
+            info!("Fast cold-start: indexed {} class names from {:?}", count, names_file);
+            return Ok(count);
+        }
+
+        if !cache_file.exists() {
+            return Ok(0);
+        }
+
+        // One-time migration from the full workspace archive: keep only the name
+        // index; classes without a jar path cannot be re-fetched lazily and stay eager.
+        let store_archive = crate::classpath::cache::load_store_archive_file(cache_file).unwrap_or(None);
+        match store_archive {
+            Some(archive) => {
+                let mut tmp = ClassStore::new();
+                tmp.append_archive(archive);
+                let pairs = tmp.fqn_path_pairs();
+                let mut names_entries: Vec<(String, String)> = Vec::new();
+                for (fqn, path) in pairs {
+                    if let Some(path) = path {
+                        if path.ends_with(".jar") {
+                            names_entries.push((fqn, path));
+                        }
+                    }
+                }
+                let count = names_entries.len();
+                self.register_pending_entries(names_entries.clone()).await;
+                let eager = tmp.export(|_, p| p.is_none());
+                if eager.class_count() > 0 {
+                    self.append_archive(eager).await;
+                }
+                let _ = crate::classpath::cache::save_names_file(&names_file, &names_entries);
+                *self.fallback_archive.write().await = Some(cache_file.to_path_buf());
+                self.mark_pending_jars_loaded().await;
+                info!("Converted workspace cache to lazy name index: {} class names", count);
+                Ok(count)
+            }
+            None => {
+                // Legacy unpooled / JSON cache: load eagerly (old behavior).
+                self.load_cache(cache_file).await
+            }
+        }
+    }
+
+    async fn register_pending_entries(&self, entries: Vec<(String, String)>) {
+        let mut pending = self.pending.write().await;
+        for (fqn, path) in entries {
+            // Only jars can be re-fetched lazily; skip stale non-jar paths
+            // (e.g. JDK temp extraction dirs written by older caches).
+            if !path.ends_with(".jar") {
+                continue;
+            }
+            pending.insert(Arc::from(fqn.as_str()), Arc::from(path.as_str()));
+        }
+    }
+
+    /// Jars named by the pending index count as indexed, so re-walking the
+    /// workspace does not scan them again.
+    async fn mark_pending_jars_loaded(&self) {
+        let paths: Vec<String> = {
+            let pending = self.pending.read().await;
+            let mut set = std::collections::HashSet::new();
+            for p in pending.by_fqn.values() {
+                set.insert(p.to_string());
+            }
+            set.into_iter().collect()
+        };
+        let mut loaded = self.loaded_jars.write().await;
+        for path in paths {
+            let p = std::path::PathBuf::from(&path);
+            let canonical = p.canonicalize().unwrap_or(p);
+            loaded.insert(canonical);
+        }
     }
 
     /// Persist the in-memory registry to a binary compressed disk cache file for instant startup
     pub async fn save_cache<P: AsRef<Path>>(&self, cache_file: P) -> Result<usize, String> {
         let p = cache_file.as_ref();
-        let classes = self.classes.read().await;
-        let count = classes.len();
+        let archive = {
+            let store = self.store.read().await;
+            store.export(|_, _| true)
+        };
+        let count = archive.class_count();
 
-        crate::classpath::cache::save_archive_file_from_refs(p, classes.values().map(|c| c.as_ref()), count)?;
+        crate::classpath::cache::save_store_archive_file(p, &archive)?;
         info!("Saved {} classes to persistent index cache: {:?}", count, p);
         Ok(count)
     }
@@ -406,11 +832,46 @@ impl ClasspathRegistry {
             }
         };
 
-        let list = crate::classpath::cache::load_archive_file(&resolved_path)?;
-        let count = list.len();
-        self.register_classes(list).await;
+        // A corrupted or older cache format must never break startup: fall back to legacy decode.
+        let store_archive = crate::classpath::cache::load_store_archive_file(&resolved_path).unwrap_or(None);
+        let count = match store_archive {
+            Some(archive) => {
+                let count = archive.class_count();
+                self.append_archive(archive).await;
+                count
+            }
+            None => {
+                // Legacy (unpooled) cache: decode, re-intern, then rewrite in the
+                // pooled format so later startups skip the costly materialization.
+                let list = crate::classpath::cache::load_archive_file(&resolved_path)?;
+                let count = list.len();
+                let archive = ArchivedStore::from_classes(&list);
+                self.register_classes(list).await;
+                let _ = crate::classpath::cache::save_store_archive_file(&resolved_path, &archive);
+                count
+            }
+        };
+        self.mark_cached_jars_loaded().await;
         info!("Loaded {} classes from persistent index cache: {:?}", count, resolved_path);
         Ok(count)
+    }
+
+    /// Cached classes know which jars they came from; treat those jars as loaded
+    /// so re-walking the workspace does not parse them again.
+    async fn mark_cached_jars_loaded(&self) {
+        let paths = { self.store.read().await.source_paths() };
+        if paths.is_empty() {
+            return;
+        }
+        let mut loaded = self.loaded_jars.write().await;
+        for path in paths {
+            if !path.ends_with(".jar") {
+                continue;
+            }
+            let p = std::path::PathBuf::from(&path);
+            let canonical = p.canonicalize().unwrap_or(p);
+            loaded.insert(canonical);
+        }
     }
 }
 
@@ -1336,7 +1797,7 @@ mod tests {
             }
         }
         let rss_after_jars = get_rss_kb();
-        let class_count = registry.classes.read().await.len();
+        let class_count = registry.store.read().await.class_count();
 
         println!("=== RSS MEMORY MEASUREMENT ===");
         println!("Start RSS: {:.2} MB", rss_start as f64 / 1024.0);
@@ -1451,9 +1912,8 @@ mod tests {
             is_public: true,
         }).await;
 
-        let s_idx = registry.simple_name_index.read().await;
-        assert_eq!(s_idx.get("Foo").unwrap().len(), 1, "Simple name index must NOT contain duplicate FQNs!");
-        drop(s_idx);
+        let duplicate_count = registry.store.read().await.simple_class_indices("Foo").len();
+        assert_eq!(duplicate_count, 1, "Simple name index must NOT contain duplicate FQNs!");
         assert_eq!(registry.origins.read().await.len(), 0, "No duplicate origin entry should exist!");
 
         // 3. Register conflicting class from jar B -> Now origins should record the conflict

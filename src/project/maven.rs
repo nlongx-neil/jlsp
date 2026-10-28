@@ -176,22 +176,39 @@ impl MavenProject {
             Err(_) => return PathBuf::from(".m2/repository"),
         };
         let settings_path = home.join(".m2").join("settings.xml");
-        if settings_path.exists() {
-            if let Ok(content) = fs::read_to_string(&settings_path) {
-                if let Some(start) = content.find("<localRepository>") {
-                    if let Some(end) = content[start..].find("</localRepository>") {
-                        let custom_path = content[start + 17..start + end].trim();
-                        if !custom_path.is_empty() {
-                            let p = PathBuf::from(custom_path);
-                            if p.exists() {
-                                return p;
-                            }
-                        }
-                    }
-                }
+        if let Ok(content) = fs::read_to_string(&settings_path) {
+            if let Some(p) = Self::parse_local_repository(&content, &home) {
+                return p;
             }
         }
         home.join(".m2").join("repository")
+    }
+
+    /// Extract `<localRepository>` from settings.xml content.
+    ///
+    /// XML comments are stripped first: the stock settings.xml ships a
+    /// commented-out `<localRepository>` example that must not be treated as
+    /// real configuration. `${user.home}` is expanded against `home`.
+    fn parse_local_repository(content: &str, home: &std::path::Path) -> Option<PathBuf> {
+        let mut cleaned = String::with_capacity(content.len());
+        let mut rest = content;
+        while let Some(start) = rest.find("<!--") {
+            cleaned.push_str(&rest[..start]);
+            match rest[start..].find("-->") {
+                Some(end) => rest = &rest[start + end + 3..],
+                None => return None,
+            }
+        }
+        cleaned.push_str(rest);
+
+        let start = cleaned.find("<localRepository>")?;
+        let end = cleaned[start..].find("</localRepository>")?;
+        let raw = cleaned[start + 17..start + end].trim();
+        let expanded = raw.replace("${user.home}", &home.to_string_lossy().to_string());
+        if expanded.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(expanded))
     }
 
     /// Resolve scoped jars: (compile_and_runtime_jars, test_scoped_jars)
@@ -334,11 +351,7 @@ impl MavenProject {
     /// Resolve jars locally or download from Maven Central if missing (including test scope)
     pub async fn resolve_and_download_jars(&self) -> Vec<PathBuf> {
         let mut jars = self.resolve_local_jars();
-        let home = match std::env::var("HOME") {
-            Ok(h) => PathBuf::from(h),
-            Err(_) => return jars,
-        };
-        let m2_repo = home.join(".m2").join("repository");
+        let m2_repo = Self::find_m2_repository();
 
         for dep in &self.dependencies {
             if let Some(version) = &dep.version {
@@ -405,6 +418,50 @@ impl MavenProject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_local_repository_custom_path() {
+        let home = PathBuf::from("/home/tester");
+        let xml = r#"
+            <settings>
+                <localRepository>/data/maven-repo</localRepository>
+            </settings>
+        "#;
+        assert_eq!(
+            MavenProject::parse_local_repository(xml, &home),
+            Some(PathBuf::from("/data/maven-repo"))
+        );
+    }
+
+    #[test]
+    fn test_parse_local_repository_ignores_commented_example() {
+        let home = PathBuf::from("/home/tester");
+        // Stock settings.xml ships the tag inside a comment; it must be ignored.
+        let xml = r#"
+            <settings>
+                <!--
+                <localRepository>/path/to/local/repo</localRepository>
+                -->
+            </settings>
+        "#;
+        assert_eq!(MavenProject::parse_local_repository(xml, &home), None);
+    }
+
+    #[test]
+    fn test_parse_local_repository_expands_user_home() {
+        let home = PathBuf::from("/home/tester");
+        let xml = r#"<settings><localRepository>${user.home}/custom-repo</localRepository></settings>"#;
+        assert_eq!(
+            MavenProject::parse_local_repository(xml, &home),
+            Some(PathBuf::from("/home/tester/custom-repo"))
+        );
+    }
+
+    #[test]
+    fn test_parse_local_repository_absent() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(MavenProject::parse_local_repository("<settings/>", &home), None);
+    }
 
     #[test]
     fn test_parse_pom_xml() {
