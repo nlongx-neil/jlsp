@@ -99,6 +99,11 @@ fi
 # 确保在 Linux 静态编译中强制静态链接 C/C++ 运行时
 export RUSTFLAGS="-C target-feature=+crt-static ${RUSTFLAGS:-}"
 
+# zig cc 会将 C 代码中的 __DATE__/__TIME__ 宏视为不可复现而直接报错
+# （mimalloc 在 windows-gnu 目标下触发 -Werror,-Wdate-time；SOURCE_DATE_EPOCH 无效），
+# 通过 cc-rs 的 target 级 CFLAGS 显式关闭该诊断。
+export CFLAGS_x86_64_pc_windows_gnu="-Wno-date-time ${CFLAGS_x86_64_pc_windows_gnu:-}"
+
 echo "======================================================================="
 echo "📦 正在打包 ${APP_NAME} v${VERSION} 全平台多架构原生二进制"
 echo "   编译工具   : ${BUILD_CMD}"
@@ -108,7 +113,9 @@ echo "   静态单文件  : ${RAW_BIN_DIR}"
 echo "======================================================================="
 
 SHA_FILE="${OUT_DIR}/sha256sums.txt"
-rm -f "${SHA_FILE}"
+# 容错：IDE/沙箱环境可能拦截对 dist/ 下文件的删除（EPERM），
+# 依次尝试删除、就地清空，均失败则跳过（后续写入会真实报错，此处不提前中断构建）
+rm -f "${SHA_FILE}" 2>/dev/null || : > "${SHA_FILE}" 2>/dev/null || true
 
 for spec in "${TARGET_SPECS[@]}"; do
   IFS='|' read -r target os_name arch_name out_bin_name archive_ext <<< "$spec"

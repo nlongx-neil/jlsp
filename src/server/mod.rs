@@ -473,7 +473,7 @@ impl JlspServer {
         });
 
         // 5. Priority 5: Decompile class info into a .java stub
-        let (file_content, is_real_source) = match real_source {
+        let (mut file_content, is_real_source) = match real_source {
             Some(src) => (src, true),
             None => {
                 let decompiled = target_cls.source_path.as_ref()
@@ -489,6 +489,19 @@ impl JlspServer {
                 (decompiled, false)
             }
         };
+
+        // Prepend provenance header carrying the REAL origin JAR path, so that
+        // clients (e.g. DevWorkbench) can display which dependency the class came from.
+        if let Some(ref sp) = target_cls.source_path {
+            if sp.ends_with(".jar") {
+                let header = if is_real_source {
+                    format!("// Extracted from: {}\n", sp)
+                } else {
+                    format!("// Decompiled from: {}\n", sp)
+                };
+                file_content = format!("{}{}", header, file_content);
+            }
+        }
 
         // Cache folder for source/decompiled files:
         // Use ~/.jlsp/sources or ~/.jlsp/decompiled, falling back to temp_dir()
