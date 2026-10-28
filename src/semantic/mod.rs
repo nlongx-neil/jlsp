@@ -101,7 +101,7 @@ impl<'a> SemanticContext<'a> {
             }
             if let Some(idx) = self.indexer {
                 if let Some(sym) = idx.find_by_fqn(type_name).await {
-                    return Some(Arc::new(sym.class_info));
+                    return Some(Arc::new(sym.class_info.clone()));
                 }
             }
         }
@@ -114,7 +114,7 @@ impl<'a> SemanticContext<'a> {
                 }
                 if let Some(idx) = self.indexer {
                     if let Some(sym) = idx.find_by_fqn(imp).await {
-                        return Some(Arc::new(sym.class_info));
+                        return Some(Arc::new(sym.class_info.clone()));
                     }
                 }
                 if crate::classpath::is_standard_jdk_package(imp) {
@@ -152,12 +152,14 @@ impl<'a> SemanticContext<'a> {
             if imp.ends_with(".*") {
                 let pkg = imp.trim_end_matches(".*");
                 let candidate_fqn = format!("{pkg}.{simple_name}");
-                if let Some(cls) = self.classpath.get_class(&candidate_fqn).await {
+                // Strict lookup: a wildcard candidate that does not really exist must
+                // stay unresolved so later candidates (same package, java.lang) win.
+                if let Some(cls) = self.classpath.get_class_strict(&candidate_fqn).await {
                     return Some(cls);
                 }
                 if let Some(idx) = self.indexer {
                     if let Some(sym) = idx.find_by_fqn(&candidate_fqn).await {
-                        return Some(Arc::new(sym.class_info));
+                        return Some(Arc::new(sym.class_info.clone()));
                     }
                 }
                 if crate::classpath::is_standard_jdk_package(&candidate_fqn) {
@@ -171,12 +173,16 @@ impl<'a> SemanticContext<'a> {
         // 4. Check same package
         if let Some(pkg) = &self.package {
             let fqn = format!("{pkg}.{simple_name}");
-            if let Some(cls) = self.classpath.get_class(&fqn).await {
+            // Strict lookup: when the current package does not really contain this
+            // type (common inside decompiled library files whose package matches a
+            // "known framework" prefix), we must fall through to java.lang instead
+            // of accepting a synthesized empty stub.
+            if let Some(cls) = self.classpath.get_class_strict(&fqn).await {
                 return Some(cls);
             }
             if let Some(idx) = self.indexer {
                 if let Some(sym) = idx.find_by_fqn(&fqn).await {
-                    return Some(Arc::new(sym.class_info));
+                    return Some(Arc::new(sym.class_info.clone()));
                 }
             }
         }
@@ -199,7 +205,7 @@ impl<'a> SemanticContext<'a> {
         // 7. Search workspace index candidates by simple name and package context
         if let Some(idx) = self.indexer {
             if let Some(sym) = idx.find_candidate(simple_name, self.package.as_deref(), &self.imports).await {
-                return Some(Arc::new(sym.class_info));
+                return Some(Arc::new(sym.class_info.clone()));
             }
         }
 
@@ -233,14 +239,8 @@ impl<'a> SemanticContext<'a> {
             }
         }
 
-        // 2. Search in classpath
-        for cls in self.classpath.all_classes().await {
-            for m in &cls.methods {
-                if m.name == method_name {
-                    results.push(m.clone());
-                }
-            }
-        }
+        // 2. Search in classpath (indexed by method name)
+        results.extend(self.classpath.find_methods_by_name(method_name).await);
 
         results
     }
@@ -331,13 +331,9 @@ impl<'a> SemanticContext<'a> {
             }
         }
 
-        // 2. Check classpath
-        for cls in self.classpath.all_classes().await {
-            if cls.super_class.as_deref() == Some(target_name)
-                || cls.interfaces.iter().any(|i| i == target_name || i.ends_with(&format!(".{target_name}")))
-            {
-                impls.push((*cls).clone());
-            }
+        // 2. Check classpath (reverse inheritance index)
+        for cls in self.classpath.find_subclasses(target_name).await {
+            impls.push((*cls).clone());
         }
 
         impls
@@ -1058,11 +1054,11 @@ impl<'a> SemanticContext<'a> {
 
         // If no dot member completion, suggest in-scope classes and keywords
         if items.is_empty() && !self.ast.is_after_dot_access(line, character) {
-            for cls in self.classpath.all_classes().await {
+            for (simple_name, fqn) in self.classpath.class_summaries().await {
                 items.push(CompletionItem {
-                    label: cls.simple_name.clone(),
+                    label: simple_name,
                     kind: CompletionKind::Class,
-                    detail: Some(cls.fqn.clone()),
+                    detail: Some(fqn),
                 });
             }
 

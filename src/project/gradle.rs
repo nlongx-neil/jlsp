@@ -299,8 +299,8 @@ impl GradleProject {
 
         // 1. Check ~/.gradle/caches/modules-2/files-2.1/<group>/<artifact>/<version>/*/jar
         let gradle_cache = home.join(".gradle").join("caches").join("modules-2").join("files-2.1");
-        // 2. Check ~/.m2/repository
-        let m2_repo = home.join(".m2").join("repository");
+        // 2. Check the Maven local repository (honors ~/.m2/settings.xml localRepository)
+        let m2_repo = super::maven::MavenProject::find_m2_repository();
 
         for dep in &self.dependencies {
             let mut resolved = false;

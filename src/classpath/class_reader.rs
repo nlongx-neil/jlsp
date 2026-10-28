@@ -130,6 +130,31 @@ pub fn parse_class_bytes(bytes: &[u8]) -> Result<ClassInfo, String> {
     })
 }
 
+/// List the fully-qualified class names contained in a jar, reading only the
+/// zip central directory (no class bytes are parsed). Used for lazy indexing.
+pub fn scan_jar_class_names<P: AsRef<Path>>(jar_path: P) -> Result<Vec<String>, String> {
+    let file = File::open(&jar_path).map_err(|e| format!("Cannot open jar {}: {e}", jar_path.as_ref().display()))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Zip error: {e}"))?;
+
+    let mut names = Vec::new();
+    for i in 0..archive.len() {
+        let entry = match archive.by_index(i) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let name = entry.name();
+        if !name.ends_with(".class") || name.starts_with("META-INF/") {
+            continue;
+        }
+        let fqn = name.trim_end_matches(".class").replace('/', ".");
+        if fqn.ends_with(".module-info") || fqn == "module-info" || fqn.ends_with(".package-info") {
+            continue;
+        }
+        names.push(fqn);
+    }
+    Ok(names)
+}
+
 pub fn parse_jar_file<P: AsRef<Path>>(jar_path: P) -> Result<Vec<ClassInfo>, String> {
     let file = File::open(&jar_path).map_err(|e| format!("Cannot open jar {}: {e}", jar_path.as_ref().display()))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Zip error: {e}"))?;

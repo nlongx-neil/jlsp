@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::indexer::WorkspaceIndex;
+use crate::indexer::{SourceSymbol, WorkspaceIndex};
 use crate::syntax::JavaAst;
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +230,7 @@ impl McpServer {
             "search_code_symbols" => {
                 let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let symbols = self.index.search_symbols(query).await;
+                let symbols: Vec<&SourceSymbol> = symbols.iter().map(|s| s.as_ref()).collect();
                 json!({
                     "content": [{
                         "type": "text",

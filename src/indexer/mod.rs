@@ -1,5 +1,7 @@
+use bincode::Options;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -9,6 +11,45 @@ use crate::model::ClassInfo;
 use crate::syntax::JavaAst;
 
 use serde::{Deserialize, Serialize};
+
+/// Bump whenever the serialized shape of [`SourceIndexCache`] changes.
+const SOURCE_CACHE_VERSION: u32 = 3;
+
+/// Magic header written before the compressed payload. It also guards against
+/// feeding an older (structurally different) cache file to bincode, which would
+/// otherwise trust a garbage length prefix and allocate absurd amounts of memory.
+const SOURCE_CACHE_MAGIC: &[u8] = b"JLSPIDX\x03";
+
+/// Upper bound on the decoded cache size; generous for large monorepos but
+/// small enough to reject corrupted files before they exhaust memory.
+const SOURCE_CACHE_LIMIT: u64 = 512 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct SourceIndexCache {
+    version: u32,
+    root: PathBuf,
+    /// (path, mtime secs) of every indexed source/mapping file, used to invalidate stale caches
+    files: Vec<(PathBuf, u64)>,
+    symbols: Vec<SourceSymbol>,
+}
+
+/// Borrowed counterpart of [`SourceIndexCache`] for allocating-free cache writes.
+#[derive(Serialize)]
+struct SourceIndexCacheRef<'a> {
+    version: u32,
+    root: &'a Path,
+    files: &'a [(PathBuf, u64)],
+    symbols: Vec<&'a SourceSymbol>,
+}
+
+pub(crate) fn file_mtime(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceSymbol {
@@ -34,8 +75,8 @@ pub struct MyBatisXmlMapping {
 
 #[derive(Default)]
 pub struct WorkspaceIndex {
-    /// Mapping: FQN -> SourceSymbol
-    symbols_by_fqn: RwLock<HashMap<String, SourceSymbol>>,
+    /// Mapping: FQN -> SourceSymbol (shared, so lookups never deep-copy class metadata)
+    symbols_by_fqn: RwLock<HashMap<String, Arc<SourceSymbol>>>,
     /// Mapping: SimpleName -> List of FQNs
     symbols_by_simple_name: RwLock<HashMap<String, Vec<String>>>,
     /// Mapping: Mapper FQN / SimpleName -> MyBatisXmlMapping
@@ -139,7 +180,7 @@ impl WorkspaceIndex {
                     .entry(symbol.simple_name.clone())
                     .or_default()
                     .push(symbol.fqn.clone());
-                fqn_map.insert(symbol.fqn.clone(), symbol);
+                fqn_map.insert(symbol.fqn.clone(), Arc::new(symbol));
 
                 // Also index generated APT & Lombok classes (e.g. MapStruct XxxImpl, JPA Xxx_, Lombok XxxBuilder)
                 for gen_cls in apt_generated.into_iter().chain(lombok_generated) {
@@ -153,7 +194,7 @@ impl WorkspaceIndex {
                         .entry(gen_sym.simple_name.clone())
                         .or_default()
                         .push(gen_sym.fqn.clone());
-                    fqn_map.insert(gen_sym.fqn.clone(), gen_sym);
+                    fqn_map.insert(gen_sym.fqn.clone(), Arc::new(gen_sym));
                 }
             }
         }
@@ -203,16 +244,16 @@ impl WorkspaceIndex {
         }
 
         if !namespace.is_empty() {
-            let simple_ns = namespace.split('.').last().unwrap_or(&namespace).to_string();
             let mapping = MyBatisXmlMapping {
                 namespace: namespace.clone(),
                 xml_path: path.to_path_buf(),
                 statements,
             };
 
+            // Store only once under the full namespace; simple-name lookups
+            // fall back to a suffix match so we don't duplicate the mapping.
             let mut map = self.mybatis_mappers.write().await;
-            map.insert(namespace, mapping.clone());
-            map.insert(simple_ns, mapping);
+            map.insert(namespace, mapping);
         }
     }
 
@@ -277,15 +318,51 @@ impl WorkspaceIndex {
 
     pub async fn scan_workspace(&self, root: &Path) {
         let cache_path = root.join(".jlsp").join("index.bin");
-        if self.try_load_cache(&cache_path).await {
-            info!("Successfully restored workspace index from disk cache: {:?}", cache_path);
+
+        // Fast path: restore cached symbols, then re-index only files whose
+        // mtime changed (or that are new/deleted). A single edit no longer
+        // forces a full workspace re-parse.
+        if let Some(cached_files) = self.try_load_cache(&cache_path, root).await {
+            info!("Restored workspace index from disk cache; scanning for changes: {:?}", cache_path);
+            let cached: std::collections::HashMap<PathBuf, u64> =
+                cached_files.iter().cloned().collect();
+            let mut indexed_files: Vec<(PathBuf, u64)> = Vec::new();
+
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_entry(|e| !is_ignored_entry(e))
+                .filter_map(|e| e.ok())
+            {
+                let p = entry.path();
+                let ext = p.extension().and_then(|ext| ext.to_str());
+                if !matches!(ext, Some("java") | Some("xml") | Some("properties") | Some("yml") | Some("yaml")) {
+                    continue;
+                }
+                let mtime = file_mtime(p);
+                indexed_files.push((p.to_path_buf(), mtime));
+                if cached.get(p) == Some(&mtime) {
+                    continue; // unchanged since last index
+                }
+                if let Ok(content) = fs::read_to_string(p) {
+                    self.index_file(p, &content).await;
+                }
+            }
+
+            // Remove symbols for files that no longer exist on disk.
+            for (path, _) in &cached_files {
+                if !path.exists() {
+                    self.remove_file(path).await;
+                }
+            }
+
+            self.save_cache(&cache_path, root, &indexed_files).await;
             return;
         }
 
         info!("Indexing Java source and XML files in workspace: {:?}", root);
         let mut count = 0;
-        let mut collected_symbols = Vec::new();
-        let mut xml_files: Vec<(PathBuf, String)> = Vec::new();
+        let mut collected_symbols: Vec<Arc<SourceSymbol>> = Vec::new();
+        let mut indexed_files: Vec<(PathBuf, u64)> = Vec::new();
 
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -294,37 +371,42 @@ impl WorkspaceIndex {
         {
             let p = entry.path();
             let ext = p.extension().and_then(|ext| ext.to_str());
-            if ext == Some("xml") {
+            if ext == Some("xml") || ext == Some("properties") || ext == Some("yml") || ext == Some("yaml") {
+                // Index mapping/config files as we walk instead of buffering every file body.
                 if let Ok(content) = fs::read_to_string(p) {
-                    xml_files.push((p.to_path_buf(), content));
-                }
-            } else if ext == Some("properties") || ext == Some("yml") || ext == Some("yaml") {
-                if let Ok(content) = fs::read_to_string(p) {
-                    self.index_config_properties(p, &content).await;
+                    if ext == Some("xml") {
+                        self.index_mybatis_xml(p, &content).await;
+                    } else {
+                        self.index_config_properties(p, &content).await;
+                    }
+                    indexed_files.push((p.to_path_buf(), file_mtime(p)));
+                    count += 1;
                 }
             } else if ext == Some("java") {
                 if let Ok(content) = fs::read_to_string(p) {
-                    if let Some(ast) = JavaAst::parse(Arc::new(content.clone())) {
+                    let shared = Arc::new(content);
+                    if let Some(ast) = JavaAst::parse(Arc::clone(&shared)) {
                         let classes = ast.extract_classes(Some(p.to_string_lossy().to_string()));
                         for mut cls in classes {
-                            let lombok_generated = crate::semantic::lombok::process_lombok_annotations(&mut cls, &content);
-                            let apt_generated = crate::semantic::apt_jdwp::AnnotationProcessorRunner::process_apt_annotations(&mut cls, &content);
-                            collected_symbols.push(SourceSymbol {
+                            let lombok_generated = crate::semantic::lombok::process_lombok_annotations(&mut cls, shared.as_str());
+                            let apt_generated = crate::semantic::apt_jdwp::AnnotationProcessorRunner::process_apt_annotations(&mut cls, shared.as_str());
+                            collected_symbols.push(Arc::new(SourceSymbol {
                                 fqn: cls.fqn.clone(),
                                 simple_name: cls.simple_name.clone(),
                                 path: p.to_path_buf(),
                                 class_info: cls,
-                            });
+                            }));
                             for gen_cls in apt_generated.into_iter().chain(lombok_generated) {
-                                collected_symbols.push(SourceSymbol {
+                                collected_symbols.push(Arc::new(SourceSymbol {
                                     fqn: gen_cls.fqn.clone(),
                                     simple_name: gen_cls.simple_name.clone(),
                                     path: p.to_path_buf(),
                                     class_info: gen_cls,
-                                });
+                                }));
                             }
                         }
                     }
+                    indexed_files.push((p.to_path_buf(), file_mtime(p)));
                     count += 1;
                 }
             }
@@ -343,58 +425,83 @@ impl WorkspaceIndex {
             }
         }
 
-        // Index XML files
-        for (xml_p, xml_content) in xml_files {
-            self.index_mybatis_xml(&xml_p, &xml_content).await;
-            count += 1;
-        }
-
         info!("Indexed {} source/mapping files in workspace.", count);
 
         // Save index to disk cache for fast warm-starts
-        self.save_cache(&cache_path).await;
+        self.save_cache(&cache_path, root, &indexed_files).await;
     }
 
-    pub async fn try_load_cache(&self, cache_file: &Path) -> bool {
-        if !cache_file.exists() {
-            return false;
+    /// Load the workspace symbol cache from disk.
+    /// Returns the list of `(path, mtime)` entries recorded in the cache so the
+    /// caller can do an incremental re-index (only changed/new files are parsed).
+    /// Returns `None` when the cache is missing, structurally incompatible, or
+    /// belongs to a different workspace root.
+    pub async fn try_load_cache(&self, cache_file: &Path, root: &Path) -> Option<Vec<(PathBuf, u64)>> {
+        let file = fs::File::open(cache_file).ok()?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut magic = [0u8; 8];
+        if reader.read_exact(&mut magic).is_err() || magic != *SOURCE_CACHE_MAGIC {
+            return None;
         }
-        if let Ok(bytes) = fs::read(cache_file) {
-            let decompressed = if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-                zstd::decode_all(&bytes[..]).unwrap_or_else(|_| bytes.clone())
-            } else {
-                bytes
-            };
-            if let Ok(symbols) = bincode::deserialize::<Vec<SourceSymbol>>(&decompressed) {
-                let mut fqn_map = self.symbols_by_fqn.write().await;
-                let mut name_map = self.symbols_by_simple_name.write().await;
-                for sym in symbols {
-                    name_map
-                        .entry(sym.simple_name.clone())
-                        .or_default()
-                        .push(sym.fqn.clone());
-                    fqn_map.insert(sym.fqn.clone(), sym);
-                }
-                return true;
-            }
+        let mut decoder = zstd::Decoder::new(reader).ok()?;
+        let cache: SourceIndexCache = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(SOURCE_CACHE_LIMIT)
+            .deserialize_from(&mut decoder)
+            .ok()?;
+
+        // Only structural identity is checked here; per-file mtime validity is
+        // enforced by the caller during the incremental scan so a single
+        // changed file no longer invalidates the entire cache.
+        if cache.version != SOURCE_CACHE_VERSION || cache.root != root {
+            return None;
         }
-        false
+
+        let mut fqn_map = self.symbols_by_fqn.write().await;
+        let mut name_map = self.symbols_by_simple_name.write().await;
+        for sym in cache.symbols {
+            name_map
+                .entry(sym.simple_name.clone())
+                .or_default()
+                .push(sym.fqn.clone());
+            fqn_map.insert(sym.fqn.clone(), Arc::new(sym));
+        }
+        Some(cache.files)
     }
 
-    pub async fn save_cache(&self, cache_file: &Path) {
+    pub async fn save_cache(&self, cache_file: &Path, root: &Path, files: &[(PathBuf, u64)]) {
         if let Some(parent) = cache_file.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let fqn_map = self.symbols_by_fqn.read().await;
-        let symbols: Vec<SourceSymbol> = fqn_map.values().cloned().collect();
-        if let Ok(encoded) = bincode::serialize(&symbols) {
-            let payload = zstd::encode_all(&encoded[..], 3).unwrap_or(encoded);
-            let _ = fs::write(cache_file, payload);
-            info!("Persisted {} symbols to disk cache: {:?}", symbols.len(), cache_file);
+        let cache = SourceIndexCacheRef {
+            version: SOURCE_CACHE_VERSION,
+            root,
+            files,
+            symbols: fqn_map.values().map(|sym| sym.as_ref()).collect(),
+        };
+        let file = match fs::File::create(cache_file) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut writer = BufWriter::new(file);
+        if writer.write_all(SOURCE_CACHE_MAGIC).is_err() {
+            return;
         }
+        let mut encoder = match zstd::Encoder::new(writer, 3) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        if bincode::serialize_into(&mut encoder, &cache).is_err() {
+            return;
+        }
+        if let Ok(mut writer) = encoder.finish() {
+            let _ = writer.flush();
+        }
+        info!("Persisted {} symbols to disk cache: {:?}", fqn_map.len(), cache_file);
     }
 
-    pub async fn find_by_simple_name(&self, simple_name: &str) -> Vec<SourceSymbol> {
+    pub async fn find_by_simple_name(&self, simple_name: &str) -> Vec<Arc<SourceSymbol>> {
         let name_map = self.symbols_by_simple_name.read().await;
         let fqn_map = self.symbols_by_fqn.read().await;
 
@@ -405,7 +512,7 @@ impl WorkspaceIndex {
         }
     }
 
-    pub async fn find_by_fqn(&self, fqn: &str) -> Option<SourceSymbol> {
+    pub async fn find_by_fqn(&self, fqn: &str) -> Option<Arc<SourceSymbol>> {
         let fqn_map = self.symbols_by_fqn.read().await;
         fqn_map.get(fqn).cloned()
     }
@@ -416,7 +523,7 @@ impl WorkspaceIndex {
         name_or_fqn: &str,
         preferred_package: Option<&str>,
         imports: &[String],
-    ) -> Option<SourceSymbol> {
+    ) -> Option<Arc<SourceSymbol>> {
         let fqn_map = self.symbols_by_fqn.read().await;
 
         // 1. Exact FQN match
@@ -495,7 +602,7 @@ impl WorkspaceIndex {
         q_idx == q_chars.len()
     }
 
-    pub async fn search_symbols(&self, query: &str) -> Vec<SourceSymbol> {
+    pub async fn search_symbols(&self, query: &str) -> Vec<Arc<SourceSymbol>> {
         let fqn_map = self.symbols_by_fqn.read().await;
         if query.is_empty() {
             return fqn_map.values().cloned().collect();
@@ -507,18 +614,18 @@ impl WorkspaceIndex {
             .collect()
     }
 
-    pub async fn with_symbols<R, F: FnOnce(&HashMap<String, SourceSymbol>) -> R>(&self, f: F) -> R {
+    pub async fn with_symbols<R, F: FnOnce(&HashMap<String, Arc<SourceSymbol>>) -> R>(&self, f: F) -> R {
         let fqn_map = self.symbols_by_fqn.read().await;
         f(&fqn_map)
     }
 
-    pub async fn all_symbols(&self) -> Vec<SourceSymbol> {
+    pub async fn all_symbols(&self) -> Vec<Arc<SourceSymbol>> {
         let fqn_map = self.symbols_by_fqn.read().await;
         fqn_map.values().cloned().collect()
     }
 
     /// Find Spring bean by its bean name or qualified class name
-    pub async fn find_spring_bean(&self, bean_name: &str) -> Option<SourceSymbol> {
+    pub async fn find_spring_bean(&self, bean_name: &str) -> Option<Arc<SourceSymbol>> {
         let clean_name = bean_name.trim_matches('"');
         let fqn_map = self.symbols_by_fqn.read().await;
 
@@ -563,7 +670,7 @@ impl WorkspaceIndex {
     }
 
     /// Search for classes implementing or extending target_name across the whole workspace
-    pub async fn find_implementations(&self, target_name: &str) -> Vec<SourceSymbol> {
+    pub async fn find_implementations(&self, target_name: &str) -> Vec<Arc<SourceSymbol>> {
         let fqn_map = self.symbols_by_fqn.read().await;
         fqn_map
             .values()
@@ -575,16 +682,29 @@ impl WorkspaceIndex {
             .collect()
     }
 
-    /// Lookup MyBatis XML mapping by mapper FQN or interface simple name
+    /// Lookup MyBatis XML mapping by mapper FQN or interface simple name.
     pub async fn find_mybatis_mapping(&self, mapper_name: &str) -> Option<MyBatisXmlMapping> {
         let map = self.mybatis_mappers.read().await;
-        map.get(mapper_name).cloned()
+        if let Some(m) = map.get(mapper_name) {
+            return Some(m.clone());
+        }
+        // Fallback: match by simple name (last segment of the namespace).
+        let suffix = format!(".{}", mapper_name);
+        map.values()
+            .find(|m| m.namespace == mapper_name || m.namespace.ends_with(&suffix))
+            .cloned()
     }
 
     /// Lookup specific XML statement location: returns (xml_path, line_number)
     pub async fn find_mybatis_statement(&self, mapper_name: &str, method_name: &str) -> Option<(PathBuf, u32)> {
         let map = self.mybatis_mappers.read().await;
-        let mapping = map.get(mapper_name)?;
+        let mapping = if let Some(m) = map.get(mapper_name) {
+            m
+        } else {
+            let suffix = format!(".{}", mapper_name);
+            map.values()
+                .find(|m| m.namespace == mapper_name || m.namespace.ends_with(&suffix))?
+        };
         for stmt in &mapping.statements {
             if stmt.id == method_name {
                 return Some((mapping.xml_path.clone(), stmt.line));

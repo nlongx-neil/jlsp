@@ -932,7 +932,10 @@ impl JavaAst {
                                         }
                                     }
                                     
-                                    let body_text = m_child.child_by_field_name("body").map(|b| self.node_text(&b).to_string());
+                                    // Only remember whether a body exists; the text itself is never
+                                    // consumed by the workspace index and would otherwise duplicate
+                                    // every source file in memory and in the on-disk index cache.
+                                    let has_body = m_child.child_by_field_name("body").is_some();
                                     methods.push(MethodInfo {
                                         name: m_name,
                                         return_type: ret_type,
@@ -941,7 +944,7 @@ impl JavaAst {
                                         is_public,
                                         is_constructor: is_ctor,
                                         javadoc: None,
-                                        body: body_text,
+                                        body: if has_body { Some(String::new()) } else { None },
                                     });
                                 }
                             } else if m_child.kind() == "annotation_type_element_declaration" {

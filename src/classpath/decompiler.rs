@@ -2532,7 +2532,7 @@ pub fn extract_source_from_sources_jar(jar_path: &Path, fqn: &str) -> Option<Str
         let expected_name = format!("{}-sources.jar", artifact_part);
 
         let search_dirs = [
-            home.join(".m2/repository"),
+            crate::project::maven::MavenProject::find_m2_repository(),
             home.join(".gradle/caches/modules-2/files-2.1"),
         ];
         for base in search_dirs {

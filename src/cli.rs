@@ -151,10 +151,10 @@ impl CliChecker {
         println!("Scanning and extracting library sources for: {:?}", root);
         let mut extracted_count = 0;
 
-        // Search ~/.gradle/caches and ~/.m2/repository for *-sources.jar
+        // Search ~/.gradle/caches and the Maven local repository (honors ~/.m2/settings.xml)
         let search_dirs = [
             dirs_home().map(|h| h.join(".gradle/caches")),
-            dirs_home().map(|h| h.join(".m2/repository")),
+            Some(crate::project::maven::MavenProject::find_m2_repository()),
         ];
 
         for dir_opt in search_dirs.into_iter().flatten() {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
@@ -35,6 +36,7 @@ use tower_lsp::lsp_types::{
     DidChangeWorkspaceFoldersParams, ExecuteCommandParams,
 };
 use tower_lsp::{Client, LanguageServer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;
 
@@ -55,6 +57,28 @@ pub struct JlspServer {
     pub classpath: Arc<ClasspathRegistry>,
     pub indexer: Arc<WorkspaceIndex>,
     pub documents: DashMap<Url, DocumentState>,
+}
+
+/// Walk up from a changed build file to the nearest project root (pom/gradle/git).
+fn find_project_root(path: &Path) -> PathBuf {
+    let mut current = path.parent().unwrap_or(path);
+    let mut fallback = current.to_path_buf();
+    loop {
+        if current.join("pom.xml").exists()
+            || current.join("build.gradle").exists()
+            || current.join("build.gradle.kts").exists()
+            || current.join(".git").exists()
+        {
+            return current.to_path_buf();
+        }
+        match current.parent() {
+            Some(parent) => {
+                current = parent;
+                fallback = parent.to_path_buf();
+            }
+            None => return fallback,
+        }
+    }
 }
 
 fn find_target_line_in_source(content: &str, target_name: &str) -> u32 {
@@ -137,6 +161,75 @@ pub(crate) fn is_read_only_path(path: &std::path::Path) -> bool {
     false
 }
 
+/// Cached result of Maven / Gradle dependency resolution.
+///
+/// Keyed by the mtime of the root `pom.xml` and the first existing Gradle build
+/// file (`build.gradle` or `build.gradle.kts`). When both mtimes match the
+/// on-disk values, the expensive `resolve_all_modules_jars` calls are skipped
+/// and the cached jar list is reused directly.
+///
+/// Trade-off: sub-module pom/gradle changes are not detected. `cleanCache`
+/// (`java.project.cleanCache`) always removes this file, forcing a re-resolve.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DepsCache {
+    pom_mtime: Option<u64>,
+    gradle_mtime: Option<u64>,
+    jars: Vec<PathBuf>,
+}
+
+const DEPS_CACHE_MAGIC: &[u8; 9] = b"JLSPDEPS\0";
+
+/// Path to the deps cache file, sibling to the workspace index cache.
+fn deps_cache_path(cache_file: &Path) -> PathBuf {
+    cache_file
+        .parent()
+        .map(|p| p.join("deps.bin"))
+        .unwrap_or_else(|| PathBuf::from("deps.bin"))
+}
+
+fn load_deps_cache(path: &Path) -> Option<DepsCache> {
+    use std::io::{BufRead, Read};
+    use bincode::Options;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let is_zstd = reader
+        .fill_buf()
+        .ok()
+        .map(|buf| buf.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]))
+        .unwrap_or(false);
+    if !is_zstd {
+        return None;
+    }
+    let mut decoder = zstd::Decoder::new(reader).ok()?;
+    let mut magic = [0u8; 9];
+    if decoder.read_exact(&mut magic).is_err() || &magic != DEPS_CACHE_MAGIC {
+        return None;
+    }
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(64 * 1024 * 1024)
+        .deserialize_from(&mut decoder)
+        .ok()
+}
+
+fn save_deps_cache(path: &Path, cache: &DepsCache) -> std::result::Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("Disk write error: {e}"))?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = zstd::Encoder::new(writer, 3).map_err(|e| format!("Zstd encode error: {e}"))?;
+    encoder
+        .write_all(DEPS_CACHE_MAGIC)
+        .map_err(|e| format!("Disk write error: {e}"))?;
+    bincode::serialize_into(&mut encoder, cache)
+        .map_err(|e| format!("Bincode serialize error: {e}"))?;
+    let mut writer = encoder.finish().map_err(|e| format!("Zstd encode error: {e}"))?;
+    writer.flush().map_err(|e| format!("Disk write error: {e}"))?;
+    Ok(())
+}
+
 impl JlspServer {
     pub fn new(client: Client) -> Self {
         Self {
@@ -150,56 +243,19 @@ impl JlspServer {
     async fn index_workspace(&self, root_path: &std::path::Path) {
         let cache_file = root_path.join(".jlsp").join("index.bin.zst");
 
-        // Try fast cold-start from disk cache
-        if let Ok(loaded) = self.classpath.load_cache(&cache_file).await
+        // Try fast cold-start from disk cache (names only; metadata loads lazily)
+        if let Ok(loaded) = self.classpath.load_workspace_index(&cache_file).await
             && loaded > 0 {
-                info!("Fast cold-start: loaded {} types from persistent index cache.", loaded);
+                info!("Fast cold-start: indexed {} type names from persistent index cache.", loaded);
             }
 
         // 1. Index Java source files
         self.indexer.scan_workspace(root_path).await;
 
-        // 2. Index workspace jars
-        info!("Scanning workspace for .jar dependencies at: {:?}", root_path);
-        for entry in walkdir::WalkDir::new(root_path)
-            .into_iter()
-            .filter_entry(|e| !crate::indexer::is_ignored_entry(e))
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
-                let _ = self.classpath.add_jar(path).await;
-            }
-        }
+        // 2. Index workspace jars + resolve Maven/Gradle dependencies
+        self.reload_workspace_dependencies(root_path, &cache_file).await;
 
-        // 3. Resolve Maven pom.xml (including multi-modules) if present
-        let pom_file = root_path.join("pom.xml");
-        if pom_file.exists() {
-            info!("Found Maven pom.xml, resolving multi-module dependencies...");
-            if let Ok(maven) = MavenProject::parse(&pom_file) {
-                let jars = maven.resolve_all_modules_jars().await;
-                for jar in jars {
-                    let _ = self.classpath.add_jar(&jar).await;
-                }
-            }
-        }
-
-        // 4. Resolve Gradle build.gradle / build.gradle.kts (including multi-projects) if present
-        let gradle_files = [root_path.join("build.gradle"), root_path.join("build.gradle.kts")];
-        for g_file in gradle_files {
-            if g_file.exists() {
-                info!("Found Gradle build file ({:?}), resolving multi-project dependencies...", g_file);
-                if let Ok(gradle) = GradleProject::parse(&g_file) {
-                    let jars = gradle.resolve_all_modules_jars();
-                    for jar in jars {
-                        let _ = self.classpath.add_jar(&jar).await;
-                    }
-                }
-                break;
-            }
-        }
-
-        // 5. Scan and index pre-generated APT sources (target/generated-sources, build/generated/sources)
+        // 3. Scan and index pre-generated APT sources (target/generated-sources, build/generated/sources)
         let generated_files = crate::semantic::apt_jdwp::AnnotationProcessorRunner::scan_generated_sources(root_path);
         if !generated_files.is_empty() {
             info!("Found {} generated APT source files, indexing...", generated_files.len());
@@ -207,9 +263,94 @@ impl JlspServer {
                 self.indexer.index_file(&gen_file.path, &gen_file.content).await;
             }
         }
+    }
 
-        // 6. Persist project dependency classes (excluding JDK classes) to disk cache asynchronously
-        let _ = self.classpath.save_workspace_cache(&cache_file).await;
+    /// Load dependency classes from workspace jars / Maven / Gradle and persist the project cache.
+    /// Kept separate from full source indexing so build-file changes do not re-scan every source file.
+    async fn reload_workspace_dependencies(&self, root_path: &std::path::Path, cache_file: &std::path::Path) {
+        info!("Scanning workspace for .jar dependencies at: {:?}", root_path);
+        let mut newly_registered = 0usize;
+        for entry in walkdir::WalkDir::new(root_path)
+            .into_iter()
+            .filter_entry(|e| !crate::indexer::is_ignored_entry(e))
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+                if let Ok(n) = self.classpath.add_jar(path).await {
+                    newly_registered += n;
+                }
+            }
+        }
+
+        // Resolve Maven / Gradle dependencies, reusing the cached jar list when
+        // the root build files have not changed since the last resolution.
+        let pom_file = root_path.join("pom.xml");
+        let pom_mtime = if pom_file.exists() {
+            Some(crate::indexer::file_mtime(&pom_file))
+        } else {
+            None
+        };
+        let gradle_file = [root_path.join("build.gradle"), root_path.join("build.gradle.kts")]
+            .into_iter()
+            .find(|p| p.exists());
+        let gradle_mtime = gradle_file.as_ref().map(|p| crate::indexer::file_mtime(p));
+
+        let deps_cache_path = deps_cache_path(cache_file);
+        let mut resolved_jars: Option<Vec<PathBuf>> = None;
+
+        if let Some(cached) = load_deps_cache(&deps_cache_path) {
+            if cached.pom_mtime == pom_mtime && cached.gradle_mtime == gradle_mtime {
+                info!(
+                    "Reusing cached dependency jar list ({} jars); build files unchanged.",
+                    cached.jars.len()
+                );
+                resolved_jars = Some(cached.jars);
+            }
+        }
+
+        if resolved_jars.is_none() {
+            let mut jars = Vec::new();
+
+            if pom_mtime.is_some() {
+                info!("Found Maven pom.xml, resolving multi-module dependencies...");
+                if let Ok(maven) = MavenProject::parse(&pom_file) {
+                    jars.extend(maven.resolve_all_modules_jars().await);
+                }
+            }
+
+            if let Some(g_file) = &gradle_file {
+                info!(
+                    "Found Gradle build file ({:?}), resolving multi-project dependencies...",
+                    g_file
+                );
+                if let Ok(gradle) = GradleProject::parse(g_file) {
+                    jars.extend(gradle.resolve_all_modules_jars());
+                }
+            }
+
+            let cache = DepsCache {
+                pom_mtime,
+                gradle_mtime,
+                jars: jars.clone(),
+            };
+            if let Err(e) = save_deps_cache(&deps_cache_path, &cache) {
+                info!("Failed to persist deps cache: {}", e);
+            }
+            resolved_jars = Some(jars);
+        }
+
+        for jar in resolved_jars.unwrap() {
+            if let Ok(n) = self.classpath.add_jar(&jar).await {
+                newly_registered += n;
+            }
+        }
+
+        // Only rewrite the workspace cache when at least one new jar was
+        // registered; otherwise the on-disk index is already up to date.
+        if newly_registered > 0 {
+            let _ = self.classpath.save_workspace_cache(cache_file).await;
+        }
     }
 
     async fn publish_document_diagnostics(&self, uri: &Url, ast: &JavaAst) {
@@ -374,7 +515,7 @@ impl JlspServer {
         &self,
         cls_info: &crate::model::ClassInfo,
         target_name: &str,
-    ) -> Option<Location> {
+    ) -> Vec<Location> {
         let mut target_cls = cls_info.clone();
         if target_name != cls_info.simple_name
             && !cls_info.methods.iter().any(|m| m.name == target_name)
@@ -424,13 +565,13 @@ impl JlspServer {
                 if let Ok(content) = std::fs::read_to_string(&ws_match.path) {
                     line = find_target_line_in_source(&content, target_name);
                 }
-                return Some(Location {
+                return vec![Location {
                     uri: ws_uri,
                     range: Range {
                         start: Position { line, character: 0 },
                         end: Position { line, character: 0 },
                     },
-                });
+                }];
             }
         }
 
@@ -443,13 +584,13 @@ impl JlspServer {
                     if let Ok(content) = std::fs::read_to_string(p) {
                         line = find_target_line_in_source(&content, target_name);
                     }
-                    return Some(Location {
+                    return vec![Location {
                         uri: file_uri,
                         range: Range {
                             start: Position { line, character: 0 },
                             end: Position { line, character: 0 },
                         },
-                    });
+                    }];
                 }
             }
         }
@@ -534,17 +675,58 @@ impl JlspServer {
         // Locate line of target method/property/class in source
         let target_line = find_target_line_in_source(&file_content, target_name);
 
-        if let Ok(file_uri) = Url::from_file_path(dest_file_path) {
-            Some(Location {
+        let mut locs = Vec::new();
+        if let Ok(file_uri) = Url::from_file_path(&dest_file_path) {
+            locs.push(Location {
                 uri: file_uri,
                 range: Range {
                     start: Position { line: target_line, character: 0 },
                     end: Position { line: target_line, character: 0 },
                 },
-            })
-        } else {
-            None
+            });
         }
+
+        // For jar-backed classes, also expose the real `jar:file:` entry URI
+        // so the user can see the originating artifact (and supporting IDEs
+        // can open the jar entry directly).
+        if let Some(jar_loc) = self.jar_entry_location(&target_cls, target_line) {
+            locs.push(jar_loc);
+        }
+
+        locs
+    }
+
+    /// Build a `jar:file:/abs/path.jar!/pkg/Class.class` location for a class
+    /// that originates from a jar file. Returns None for non-jar sources
+    /// (workspace .java, JDK src.zip, jimage-extracted temp classes, ...).
+    fn jar_entry_location(
+        &self,
+        cls: &crate::model::ClassInfo,
+        target_line: u32,
+    ) -> Option<Location> {
+        let sp = cls.source_path.as_deref()?;
+        if !sp.ends_with(".jar") {
+            return None;
+        }
+        let jar_path = std::path::Path::new(sp);
+        let abs = if jar_path.is_absolute() {
+            sp.to_string()
+        } else {
+            std::fs::canonicalize(jar_path).ok()?.to_string_lossy().to_string()
+        };
+        let pkg_path = cls.fqn.replace('.', "/");
+        // Use file: scheme with the absolute path. `url` accepts both
+        // `file:/abs` and `file:///abs`; the former matches how `Url::from_file_path`
+        // serializes absolute paths and keeps the jar: URI round-trippable.
+        let uri_str = format!("jar:file:{}!/{}.class", abs, pkg_path);
+        let uri = Url::parse(&uri_str).ok()?;
+        Some(Location {
+            uri,
+            range: Range {
+                start: Position { line: target_line, character: 0 },
+                end: Position { line: target_line, character: 0 },
+            },
+        })
     }
 
     pub async fn resolve_jar_target_location(
@@ -552,8 +734,35 @@ impl JlspServer {
         _jar_path: &str,
         cls_info: &crate::model::ClassInfo,
         target_name: &str,
-    ) -> Option<Location> {
+    ) -> Vec<Location> {
         self.resolve_external_target_location(cls_info, target_name).await
+    }
+
+    /// Convert a list of resolved locations into a `GotoDefinitionResponse`.
+    /// Empty -> None, single -> Scalar, multiple -> Array (so IDEs can choose
+    /// between the readable decompiled source and the real jar entry).
+    fn into_definition_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
+        match locs.len() {
+            0 => None,
+            1 => Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap())),
+            _ => Some(GotoDefinitionResponse::Array(locs)),
+        }
+    }
+
+    fn into_type_definition_response(locs: Vec<Location>) -> Option<GotoTypeDefinitionResponse> {
+        match locs.len() {
+            0 => None,
+            1 => Some(GotoTypeDefinitionResponse::Scalar(locs.into_iter().next().unwrap())),
+            _ => Some(GotoTypeDefinitionResponse::Array(locs)),
+        }
+    }
+
+    fn into_declaration_response(locs: Vec<Location>) -> Option<GotoDeclarationResponse> {
+        match locs.len() {
+            0 => None,
+            1 => Some(GotoDeclarationResponse::Scalar(locs.into_iter().next().unwrap())),
+            _ => Some(GotoDeclarationResponse::Array(locs)),
+        }
     }
 
     async fn resolve_import_target(
@@ -1275,6 +1484,8 @@ impl LanguageServer for JlspServer {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // Build-file changes only reload dependencies; mapping/config changes are scoped to that file.
+        let mut build_roots: Vec<PathBuf> = Vec::new();
         for change in params.changes {
             if let Ok(path) = change.uri.to_file_path() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -1294,16 +1505,36 @@ impl LanguageServer for JlspServer {
                                 self.indexer.index_file(&path, &content).await;
                             }
                         }
-                        "xml" | "gradle" | "kts" => {
-                            info!("Build configuration changed ({:?}), reloading dependencies...", path);
-                            if let Some(parent) = path.parent() {
-                                self.index_workspace(parent).await;
+                        "xml" => {
+                            let is_build_file = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n == "pom.xml")
+                                .unwrap_or(false);
+                            if is_build_file {
+                                info!("Build configuration changed ({:?}), reloading dependencies...", path);
+                                build_roots.push(find_project_root(&path));
+                            } else if change.typ == FileChangeType::DELETED {
+                                self.indexer.remove_file(&path).await;
+                            } else if let Ok(content) = std::fs::read_to_string(&path) {
+                                self.indexer.index_mybatis_xml(&path, &content).await;
                             }
+                        }
+                        "gradle" | "kts" => {
+                            info!("Build configuration changed ({:?}), reloading dependencies...", path);
+                            build_roots.push(find_project_root(&path));
                         }
                         _ => {}
                     }
                 }
             }
+        }
+
+        build_roots.sort();
+        build_roots.dedup();
+        for root in build_roots {
+            let cache_file = root.join(".jlsp").join("index.bin.zst");
+            self.reload_workspace_dependencies(&root, &cache_file).await;
         }
     }
 
@@ -1619,7 +1850,7 @@ impl LanguageServer for JlspServer {
                                 (u, target_cls.fqn.clone())
                             } else if let Some(cand) = self.indexer.find_by_simple_name(target_class).await.into_iter().next() {
                                 let u = Url::from_file_path(&cand.path).ok();
-                                (u, cand.fqn)
+                                (u, cand.fqn.clone())
                             } else {
                                 (None, String::new())
                             };
@@ -1764,7 +1995,7 @@ impl LanguageServer for JlspServer {
 
         if let Some(super_cls) = super_class_opt {
             let (target_uri, pkg) = if let Some(sym) = self.indexer.find_by_simple_name(&super_cls).await.into_iter().next() {
-                (Url::from_file_path(&sym.path).unwrap_or_else(|_| params.item.uri.clone()), Some(sym.class_info.package_name))
+                (Url::from_file_path(&sym.path).unwrap_or_else(|_| params.item.uri.clone()), Some(sym.class_info.package_name.clone()))
             } else {
                 (params.item.uri.clone(), None)
             };
@@ -1782,7 +2013,7 @@ impl LanguageServer for JlspServer {
 
         for iface in interfaces {
             let (target_uri, pkg) = if let Some(sym) = self.indexer.find_by_simple_name(&iface).await.into_iter().next() {
-                (Url::from_file_path(&sym.path).unwrap_or_else(|_| params.item.uri.clone()), Some(sym.class_info.package_name))
+                (Url::from_file_path(&sym.path).unwrap_or_else(|_| params.item.uri.clone()), Some(sym.class_info.package_name.clone()))
             } else {
                 (params.item.uri.clone(), None)
             };
@@ -1822,10 +2053,10 @@ impl LanguageServer for JlspServer {
                     seen.insert(key);
                     let kind = if sym.class_info.kind == crate::model::ClassKind::Interface { LspSymbolKind::INTERFACE } else { LspSymbolKind::CLASS };
                     items.push(TypeHierarchyItem {
-                        name: sym.simple_name,
+                        name: sym.simple_name.clone(),
                         kind,
                         tags: None,
-                        detail: Some(sym.class_info.package_name),
+                        detail: Some(sym.class_info.package_name.clone()),
                         uri,
                         range: Range { start: Position { line: 0, character: 0 }, end: Position { line: 0, character: 0 } },
                         selection_range: Range { start: Position { line: 0, character: 0 }, end: Position { line: 0, character: 0 } },
@@ -2559,7 +2790,7 @@ impl LanguageServer for JlspServer {
 
                 #[allow(deprecated)]
                 symbols.push(SymbolInformation {
-                    name: s.simple_name,
+                    name: s.simple_name.clone(),
                     kind: LspSymbolKind::CLASS,
                     tags: None,
                     deprecated: None,
@@ -2567,7 +2798,7 @@ impl LanguageServer for JlspServer {
                         uri,
                         range,
                     },
-                    container_name: Some(s.class_info.package_name),
+                    container_name: Some(s.class_info.package_name.clone()),
                 });
             }
         }
@@ -2724,12 +2955,13 @@ impl LanguageServer for JlspServer {
                             for pm in &parent_cls.methods {
                                 if pm.name == m_name {
                                     // Found super method declaration! Resolve its location
-                                    if let Some(loc) = self.resolve_jar_target_location(
+                                    let locs = self.resolve_jar_target_location(
                                         "",
                                         &parent_cls,
                                         &m_name,
-                                    ).await {
-                                        return Ok(Some(GotoDeclarationResponse::Scalar(loc)));
+                                    ).await;
+                                    if !locs.is_empty() {
+                                        return Ok(Self::into_declaration_response(locs));
                                     }
                                 }
                             }
@@ -2808,8 +3040,9 @@ impl LanguageServer for JlspServer {
                 } else {
                     default_member
                 };
-                if let Some(loc) = self.resolve_external_target_location(&target_cls, &target_name).await {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                let locs = self.resolve_external_target_location(&target_cls, &target_name).await;
+                if !locs.is_empty() {
+                    return Ok(Self::into_definition_response(locs));
                 }
             }
         }
@@ -2875,8 +3108,9 @@ impl LanguageServer for JlspServer {
                     if info.receiver.is_some() {
                         if let Some(target_cls_name) = target_class.as_deref() {
                             if let Some(cls) = self.find_class_info(target_cls_name, current_pkg.as_deref(), &current_imports, &sem).await {
-                                if let Some(loc) = self.resolve_external_target_location(&cls, &info.member_name).await {
-                                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                                let locs = self.resolve_external_target_location(&cls, &info.member_name).await;
+                                if !locs.is_empty() {
+                                    return Ok(Self::into_definition_response(locs));
                                 }
                             }
                         }
@@ -3074,8 +3308,9 @@ impl LanguageServer for JlspServer {
                     } else {
                         &cls.simple_name
                     });
-                    if let Some(loc) = self.resolve_external_target_location(&cls, name).await {
-                        return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                    let locs = self.resolve_external_target_location(&cls, name).await;
+                    if !locs.is_empty() {
+                        return Ok(Self::into_definition_response(locs));
                     }
                 }
             }
@@ -3088,20 +3323,23 @@ impl LanguageServer for JlspServer {
                 return Ok(None);
             }
             if let Some(cls) = sem.resolve_type(word).await {
-                if let Some(loc) = self.resolve_external_target_location(&cls, word).await {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                let locs = self.resolve_external_target_location(&cls, word).await;
+                if !locs.is_empty() {
+                    return Ok(Self::into_definition_response(locs));
                 }
             }
             for cls in self.classpath.find_classes_by_simple_name(word).await {
-                if let Some(loc) = self.resolve_external_target_location(&cls, word).await {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                let locs = self.resolve_external_target_location(&cls, word).await;
+                if !locs.is_empty() {
+                    return Ok(Self::into_definition_response(locs));
                 }
             }
             let common_jdk = crate::classpath::find_common_jdk_classes_by_name(word);
             for fqn in common_jdk {
                 if let Some(cls) = crate::classpath::get_builtin_jdk_class(&fqn) {
-                    if let Some(loc) = self.resolve_external_target_location(&cls, word).await {
-                        return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                    let locs = self.resolve_external_target_location(&cls, word).await;
+                    if !locs.is_empty() {
+                        return Ok(Self::into_definition_response(locs));
                     }
                 }
             }
@@ -3752,9 +3990,9 @@ impl LanguageServer for JlspServer {
                 for sym in self.indexer.find_by_simple_name(word).await {
                     if seen_fqns.insert(sym.fqn.clone()) {
                         candidates.push(CandItem {
-                            simple_name: sym.simple_name,
-                            fqn: sym.fqn,
-                            package_name: sym.class_info.package_name,
+                            simple_name: sym.simple_name.clone(),
+                            fqn: sym.fqn.clone(),
+                            package_name: sym.class_info.package_name.clone(),
                         });
                     }
                 }
@@ -5770,8 +6008,9 @@ impl LanguageServer for JlspServer {
                 }
                 crate::semantic::GotoTarget::External { cls, target_name } => {
                     let name = target_name.as_deref().unwrap_or(&cls.simple_name);
-                    if let Some(loc) = self.resolve_external_target_location(&cls, name).await {
-                        return Ok(Some(GotoTypeDefinitionResponse::Scalar(loc)));
+                    let locs = self.resolve_external_target_location(&cls, name).await;
+                    if !locs.is_empty() {
+                        return Ok(Self::into_type_definition_response(locs));
                     }
                 }
             }
@@ -5827,6 +6066,17 @@ impl LanguageServer for JlspServer {
                 if jlsp_dir.exists() {
                     let _ = std::fs::remove_dir_all(jlsp_dir);
                     cleaned = true;
+                }
+                // Also clear on-demand decompiled / extracted source stubs that
+                // live outside the workspace cache directory.
+                if let Some(home) = crate::classpath::dirs_home() {
+                    for sub in ["sources", "decompiled"] {
+                        let dir = home.join(".jlsp").join(sub);
+                        if dir.exists() {
+                            let _ = std::fs::remove_dir_all(&dir);
+                            cleaned = true;
+                        }
+                    }
                 }
                 self.client.show_message(MessageType::INFO, "JLSP: Workspace cache has been cleaned.").await;
                 Ok(Some(serde_json::json!({ "cleaned": cleaned })))
@@ -11342,6 +11592,48 @@ public class MapUtils {
             partial_result_params: Default::default(),
         }).await.expect("goto_definition succeeds");
         assert!(resp_brace.is_none(), "Clicking on brace must safely return None");
+    }
+
+    /// Regression: inside a decompiled library file whose package matches a
+    /// "known framework" prefix (e.g. org.apache.commons.lang), resolving an
+    /// unqualified `java.lang` type like `String` must NOT be hijacked by a
+    /// synthesized same-package stub (org.apache.commons.lang.String). The
+    /// same-package candidate must use strict classpath lookup so resolution
+    /// falls through to java.lang.
+    #[tokio::test]
+    async fn test_same_package_resolution_not_hijacked_by_framework_stub() {
+        let (service, _) = tower_lsp::LspService::new(JlspServer::new);
+        let server = service.inner();
+
+        let code = r#"package org.apache.commons.lang;
+
+public class StringUtils {
+    public static boolean isBlank(String str) {
+        return str == null;
+    }
+}
+"#;
+        let ast = JavaAst::parse(std::sync::Arc::new(code.to_string())).expect("parse");
+        let sem = crate::semantic::SemanticContext::with_indexer(&ast, &server.classpath, Some(&server.indexer)).await;
+
+        let resolved = sem.resolve_type("String").await.expect("String must resolve");
+        assert_eq!(
+            resolved.fqn, "java.lang.String",
+            "String must resolve to java.lang.String, not a same-package stub; got {}",
+            resolved.fqn
+        );
+
+        // The same-package class that genuinely does not exist must stay unresolved
+        // via strict lookup (no synthesized framework stub).
+        assert!(
+            server.classpath.get_class_strict("org.apache.commons.lang.String").await.is_none(),
+            "get_class_strict must not synthesize stubs for nonexistent classes"
+        );
+        // ... while the lenient lookup keeps its synthesized-fallback behaviour.
+        assert!(
+            server.classpath.get_class("org.apache.commons.lang.String").await.is_some(),
+            "get_class keeps the synthesized framework fallback for hover/completion"
+        );
     }
 
     #[tokio::test]

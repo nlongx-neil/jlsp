@@ -1,10 +1,17 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
+use crate::classpath::store::ArchivedStore;
 use crate::model::{ClassInfo, ClassKind, FieldInfo, MethodInfo};
+
+/// Upper bound on decoded cache size, so a corrupted file cannot trigger a huge allocation.
+const CACHE_DECODE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Compact class archive representation for disk cache.
 /// Optimizations applied:
@@ -103,11 +110,73 @@ impl CompactClassArchive {
     }
 }
 
+/// Borrowed view of [`CompactClassInfo`] so saving a cache never deep-clones
+/// methods/fields/interfaces of the whole classpath.
+#[derive(Serialize)]
+struct CompactClassInfoRef<'a> {
+    fqn: &'a str,
+    kind: &'a ClassKind,
+    super_class: Option<&'a str>,
+    interfaces: &'a [String],
+    methods: &'a [MethodInfo],
+    fields: &'a [FieldInfo],
+    path_idx: Option<u32>,
+    is_public: bool,
+}
+
+/// Borrowed view of [`CompactClassArchive`]; serializes to the exact same
+/// bincode layout, so old caches remain readable and new caches stay compatible.
+#[derive(Serialize)]
+struct CompactClassArchiveRef<'a> {
+    version: u32,
+    paths: Vec<&'a str>,
+    classes: Vec<CompactClassInfoRef<'a>>,
+}
+
+impl<'a> CompactClassArchiveRef<'a> {
+    fn from_class_refs(
+        classes: impl IntoIterator<Item = &'a ClassInfo>,
+        count_hint: usize,
+    ) -> Self {
+        let mut paths: Vec<&'a str> = Vec::new();
+        let mut path_map: HashMap<&'a str, u32> = HashMap::new();
+        let mut compact_classes = Vec::with_capacity(count_hint);
+
+        for cls in classes {
+            let path_idx = cls.source_path.as_deref().map(|path| {
+                if let Some(&idx) = path_map.get(path) {
+                    idx
+                } else {
+                    let idx = paths.len() as u32;
+                    paths.push(path);
+                    path_map.insert(path, idx);
+                    idx
+                }
+            });
+
+            compact_classes.push(CompactClassInfoRef {
+                fqn: &cls.fqn,
+                kind: &cls.kind,
+                super_class: cls.super_class.as_deref(),
+                interfaces: &cls.interfaces,
+                methods: &cls.methods,
+                fields: &cls.fields,
+                path_idx,
+                is_public: cls.is_public,
+            });
+        }
+
+        Self {
+            version: 1,
+            paths,
+            classes: compact_classes,
+        }
+    }
+}
+
 /// Serialize classes to compact binary bytes compressed with zstd
 pub fn serialize_archive(classes: &[ClassInfo]) -> Result<Vec<u8>, String> {
-    let archive = CompactClassArchive::from_classes(classes);
-    let bin = bincode::serialize(&archive).map_err(|e| format!("Bincode serialize error: {e}"))?;
-    zstd::encode_all(&bin[..], 3).map_err(|e| format!("Zstd encode error: {e}"))
+    serialize_archive_from_refs(classes.iter(), classes.len())
 }
 
 /// Deserialize classes from bytes (supports compact zstd, raw bincode, or legacy JSON)
@@ -148,19 +217,30 @@ pub fn deserialize_archive(data: &[u8]) -> Result<Vec<ClassInfo>, String> {
 
 /// Serialize classes from iterator of references without cloning
 pub fn serialize_archive_from_refs<'a>(classes: impl IntoIterator<Item = &'a ClassInfo>, count_hint: usize) -> Result<Vec<u8>, String> {
-    let archive = CompactClassArchive::from_class_refs(classes, count_hint);
-    let bin = bincode::serialize(&archive).map_err(|e| format!("Bincode serialize error: {e}"))?;
-    zstd::encode_all(&bin[..], 3).map_err(|e| format!("Zstd encode error: {e}"))
+    let archive = CompactClassArchiveRef::from_class_refs(classes, count_hint);
+    let mut out = Vec::new();
+    {
+        let mut encoder = zstd::Encoder::new(&mut out, 3).map_err(|e| format!("Zstd encode error: {e}"))?;
+        bincode::serialize_into(&mut encoder, &archive).map_err(|e| format!("Bincode serialize error: {e}"))?;
+        encoder.finish().map_err(|e| format!("Zstd encode error: {e}"))?;
+    }
+    Ok(out)
 }
 
-/// Save classes from iterator of references without cloning
+/// Save classes from iterator of references without cloning, streaming straight to disk
 pub fn save_archive_file_from_refs<'a, P: AsRef<Path>>(path: P, classes: impl IntoIterator<Item = &'a ClassInfo>, count_hint: usize) -> Result<(), String> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let bytes = serialize_archive_from_refs(classes, count_hint)?;
-    std::fs::write(path, bytes).map_err(|e| format!("Disk write error: {e}"))
+    let archive = CompactClassArchiveRef::from_class_refs(classes, count_hint);
+    let file = File::create(path).map_err(|e| format!("Disk write error: {e}"))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = zstd::Encoder::new(writer, 3).map_err(|e| format!("Zstd encode error: {e}"))?;
+    bincode::serialize_into(&mut encoder, &archive).map_err(|e| format!("Bincode serialize error: {e}"))?;
+    let mut writer = encoder.finish().map_err(|e| format!("Zstd encode error: {e}"))?;
+    writer.flush().map_err(|e| format!("Disk write error: {e}"))?;
+    Ok(())
 }
 
 /// Save classes to an archive file
@@ -168,14 +248,132 @@ pub fn save_archive_file<P: AsRef<Path>>(path: P, classes: &[ClassInfo]) -> Resu
     save_archive_file_from_refs(path, classes.iter(), classes.len())
 }
 
-/// Load classes from an archive file
+/// Load classes from an archive file, decompressing and decoding as a stream so
+/// neither the compressed bytes nor the fully decompressed payload are held in memory.
 pub fn load_archive_file<P: AsRef<Path>>(path: P) -> Result<Vec<ClassInfo>, String> {
     let p = path.as_ref();
     if !p.exists() {
         return Ok(Vec::new());
     }
-    let data = std::fs::read(p).map_err(|e| format!("Disk read error: {e}"))?;
+    let mut reader = BufReader::new(File::open(p).map_err(|e| format!("Disk read error: {e}"))?);
+    let is_zstd = reader
+        .fill_buf()
+        .map(|buf| buf.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]))
+        .unwrap_or(false);
+    if is_zstd {
+        let mut decoder = zstd::Decoder::new(reader).map_err(|e| format!("Zstd decode error: {e}"))?;
+        let archive: CompactClassArchive = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(CACHE_DECODE_LIMIT)
+            .deserialize_from(&mut decoder)
+            .map_err(|e| format!("Bincode deserialize error: {e}"))?;
+        return Ok(archive.into_classes());
+    }
+    // Legacy raw bincode / JSON fallback (small files only)
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).map_err(|e| format!("Disk read error: {e}"))?;
     deserialize_archive(&data)
+}
+
+
+/// Magic prefix identifying the pooled (P2) store cache layout.
+const STORE_MAGIC: &[u8; 8] = b"JLSPCS2\0";
+
+/// Save a pooled [`ArchivedStore`] snapshot, streaming straight to disk.
+pub fn save_store_archive_file<P: AsRef<Path>>(path: P, archive: &ArchivedStore) -> Result<(), String> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = File::create(path).map_err(|e| format!("Disk write error: {e}"))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = zstd::Encoder::new(writer, 3).map_err(|e| format!("Zstd encode error: {e}"))?;
+    encoder
+        .write_all(STORE_MAGIC)
+        .map_err(|e| format!("Disk write error: {e}"))?;
+    bincode::serialize_into(&mut encoder, archive)
+        .map_err(|e| format!("Bincode serialize error: {e}"))?;
+    let mut writer = encoder.finish().map_err(|e| format!("Zstd encode error: {e}"))?;
+    writer.flush().map_err(|e| format!("Disk write error: {e}"))?;
+    Ok(())
+}
+
+/// Load a pooled [`ArchivedStore`] snapshot as a stream.
+/// Returns `Ok(None)` when the file is not in the pooled format (e.g. an older cache).
+pub fn load_store_archive_file<P: AsRef<Path>>(path: P) -> Result<Option<ArchivedStore>, String> {
+    let p = path.as_ref();
+    if !p.exists() {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new(File::open(p).map_err(|e| format!("Disk read error: {e}"))?);
+    let is_zstd = reader
+        .fill_buf()
+        .map(|buf| buf.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]))
+        .unwrap_or(false);
+    if !is_zstd {
+        return Ok(None);
+    }
+    let mut decoder = zstd::Decoder::new(reader).map_err(|e| format!("Zstd decode error: {e}"))?;
+    let mut magic = [0u8; 8];
+    if decoder.read_exact(&mut magic).is_err() || &magic != STORE_MAGIC {
+        return Ok(None);
+    }
+    let archive = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(CACHE_DECODE_LIMIT)
+        .deserialize_from(&mut decoder)
+        .map_err(|e| format!("Bincode deserialize error: {e}"))?;
+    Ok(Some(archive))
+}
+
+/// Magic prefix for the lazy names-index cache (`index.names.zst`).
+const NAMES_MAGIC: &[u8; 8] = b"JLSPNM1\0";
+
+/// Save `(fqn, jar_path)` pairs for lazy startup indexing.
+pub fn save_names_file<P: AsRef<Path>>(path: P, entries: &[(String, String)]) -> Result<(), String> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = File::create(path).map_err(|e| format!("Disk write error: {e}"))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = zstd::Encoder::new(writer, 3).map_err(|e| format!("Zstd encode error: {e}"))?;
+    encoder
+        .write_all(NAMES_MAGIC)
+        .map_err(|e| format!("Disk write error: {e}"))?;
+    bincode::serialize_into(&mut encoder, entries)
+        .map_err(|e| format!("Bincode serialize error: {e}"))?;
+    let mut writer = encoder.finish().map_err(|e| format!("Zstd encode error: {e}"))?;
+    writer.flush().map_err(|e| format!("Disk write error: {e}"))?;
+    Ok(())
+}
+
+/// Load `(fqn, jar_path)` pairs saved by [`save_names_file`].
+/// Returns `Ok(None)` when the file is missing or not in the names format.
+pub fn load_names_file<P: AsRef<Path>>(path: P) -> Result<Option<Vec<(String, String)>>, String> {
+    let p = path.as_ref();
+    if !p.exists() {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new(File::open(p).map_err(|e| format!("Disk read error: {e}"))?);
+    let is_zstd = reader
+        .fill_buf()
+        .map(|buf| buf.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]))
+        .unwrap_or(false);
+    if !is_zstd {
+        return Ok(None);
+    }
+    let mut decoder = zstd::Decoder::new(reader).map_err(|e| format!("Zstd decode error: {e}"))?;
+    let mut magic = [0u8; 8];
+    if decoder.read_exact(&mut magic).is_err() || &magic != NAMES_MAGIC {
+        return Ok(None);
+    }
+    let entries = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(CACHE_DECODE_LIMIT)
+        .deserialize_from(&mut decoder)
+        .map_err(|e| format!("Bincode deserialize error: {e}"))?;
+    Ok(Some(entries))
 }
 
 /// Compute a persistent, content-sensitive cache key for a jar file
