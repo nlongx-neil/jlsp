@@ -326,7 +326,7 @@ impl GradleProject {
             if !resolved {
                 if let Some(ref repo) = m2_repo {
                     if repo.exists() {
-                        let group_path = dep.group_id.replace('.', "/");
+                        let group_path = dep.group_id.replace('.', std::path::MAIN_SEPARATOR_STR);
                         let jar_file_name = format!("{}-{}.jar", dep.artifact_id, dep.version);
                         let candidate = repo
                             .join(&group_path)

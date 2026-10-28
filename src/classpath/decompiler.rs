@@ -2533,7 +2533,7 @@ pub fn extract_source_from_sources_jar(jar_path: &Path, fqn: &str) -> Option<Str
 
         let search_dirs = [
             crate::project::maven::MavenProject::find_m2_repository(),
-            Some(home.join(".gradle/caches/modules-2/files-2.1")),
+            Some(home.join(".gradle").join("caches").join("modules-2").join("files-2.1")),
         ];
         for base in search_dirs.into_iter().flatten() {
             if base.exists() {
@@ -2589,8 +2589,8 @@ pub fn extract_source_from_jdk(jdk_home_opt: Option<&Path>, fqn: &str) -> Option
 
     // 4. SDKMAN current
     if let Some(home) = crate::classpath::dirs_home() {
-        candidate_src_zips.push(home.join(".sdkman/candidates/java/current/lib/src.zip"));
-        candidate_src_zips.push(home.join(".sdkman/candidates/java/current/src.zip"));
+        candidate_src_zips.push(home.join(".sdkman").join("candidates").join("java").join("current").join("lib").join("src.zip"));
+        candidate_src_zips.push(home.join(".sdkman").join("candidates").join("java").join("current").join("src.zip"));
     }
 
     #[cfg(target_os = "macos")]
@@ -2599,8 +2599,8 @@ pub fn extract_source_from_jdk(jdk_home_opt: Option<&Path>, fqn: &str) -> Option
         if jvm_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(jvm_dir) {
                 for entry in entries.flatten() {
-                    candidate_src_zips.push(entry.path().join("Contents/Home/lib/src.zip"));
-                    candidate_src_zips.push(entry.path().join("Contents/Home/src.zip"));
+                    candidate_src_zips.push(entry.path().join("Contents").join("Home").join("lib").join("src.zip"));
+                    candidate_src_zips.push(entry.path().join("Contents").join("Home").join("src.zip"));
                 }
             }
         }

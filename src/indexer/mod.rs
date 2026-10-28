@@ -940,10 +940,10 @@ mod tests {
     async fn test_indexer_prunes_ignored_directories() {
         let temp_dir = std::env::temp_dir().join("jlsp_test_prune");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let src_dir = temp_dir.join("src/main/java/com/demo");
-        let git_dir = temp_dir.join(".git/objects");
-        let node_dir = temp_dir.join("node_modules/pkg");
-        let classes_dir = temp_dir.join("target/classes/com/demo");
+        let src_dir = temp_dir.join("src").join("main").join("java").join("com").join("demo");
+        let git_dir = temp_dir.join(".git").join("objects");
+        let node_dir = temp_dir.join("node_modules").join("pkg");
+        let classes_dir = temp_dir.join("target").join("classes").join("com").join("demo");
 
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::create_dir_all(&git_dir).unwrap();
