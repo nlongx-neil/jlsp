@@ -136,8 +136,66 @@ fn find_target_line_in_source(content: &str, target_name: &str) -> u32 {
             found_fallback = true;
         }
     }
-
     fallback_line
+}
+
+/// Count parameters of a single-line method declaration `name(...)`.
+/// Commas inside generics / nested parens are ignored. Returns None when the
+/// declaration's closing paren is not on the same line.
+fn count_decl_params(line: &str, name: &str) -> Option<usize> {
+    let start = line.find(&format!("{}(", name))? + name.len();
+    let bytes = line.as_bytes();
+    let mut paren = 0i32;
+    let mut angle = 0i32;
+    let mut commas = 0usize;
+    let mut saw_token = false;
+    for &b in &bytes[start..] {
+        match b {
+            b'(' => paren += 1,
+            b')' => {
+                paren -= 1;
+                if paren == 0 {
+                    return Some(if saw_token { commas + 1 } else { 0 });
+                }
+            }
+            b'<' => angle += 1,
+            b'>' => {
+                if angle > 0 {
+                    angle -= 1;
+                }
+            }
+            b',' if paren == 1 && angle == 0 => commas += 1,
+            c if !c.is_ascii_whitespace() && paren >= 1 => saw_token = true,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Arity-aware method line lookup: among lines containing `target_name(`,
+/// prefer one whose parameter count matches `arg_count` (so jumping to an
+/// overloaded method lands on the correct overload, e.g. `ArrayList.add(E)`
+/// instead of the private `add(E, Object[], int)`). Falls back to the generic
+/// finder when arity is unknown or nothing matches.
+fn find_method_line_with_arity(content: &str, target_name: &str, arg_count: Option<usize>) -> u32 {
+    let want = match arg_count {
+        Some(w) => w,
+        None => return find_target_line_in_source(content, target_name),
+    };
+    let needle = format!("{}(", target_name);
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+        if !line.contains(&needle) {
+            continue;
+        }
+        if count_decl_params(line, target_name) == Some(want) {
+            return idx as u32;
+        }
+    }
+    find_target_line_in_source(content, target_name)
 }
 
 pub(crate) fn is_read_only_path(path: &std::path::Path) -> bool {
@@ -515,6 +573,7 @@ impl JlspServer {
         &self,
         cls_info: &crate::model::ClassInfo,
         target_name: &str,
+        arg_count: Option<usize>,
     ) -> Vec<Location> {
         let mut target_cls = cls_info.clone();
         if target_name != cls_info.simple_name
@@ -563,7 +622,7 @@ impl JlspServer {
             if let Ok(ws_uri) = Url::from_file_path(&ws_match.path) {
                 let mut line = 0;
                 if let Ok(content) = std::fs::read_to_string(&ws_match.path) {
-                    line = find_target_line_in_source(&content, target_name);
+                    line = find_method_line_with_arity(&content, target_name, arg_count);
                 }
                 return vec![Location {
                     uri: ws_uri,
@@ -582,7 +641,7 @@ impl JlspServer {
                 if let Ok(file_uri) = Url::from_file_path(p) {
                     let mut line = 0;
                     if let Ok(content) = std::fs::read_to_string(p) {
-                        line = find_target_line_in_source(&content, target_name);
+                        line = find_method_line_with_arity(&content, target_name, arg_count);
                     }
                     return vec![Location {
                         uri: file_uri,
@@ -686,7 +745,7 @@ impl JlspServer {
         }
 
         // Locate line of target method/property/class in source
-        let target_line = find_target_line_in_source(&file_content, target_name);
+        let target_line = find_method_line_with_arity(&file_content, target_name, arg_count);
 
         let mut locs = Vec::new();
         if let Ok(file_uri) = Url::from_file_path(&dest_file_path) {
@@ -748,7 +807,7 @@ impl JlspServer {
         cls_info: &crate::model::ClassInfo,
         target_name: &str,
     ) -> Vec<Location> {
-        self.resolve_external_target_location(cls_info, target_name).await
+        self.resolve_external_target_location(cls_info, target_name, None).await
     }
 
     /// Convert a list of resolved locations into a `GotoDefinitionResponse`.
@@ -3053,7 +3112,7 @@ impl LanguageServer for JlspServer {
                 } else {
                     default_member
                 };
-                let locs = self.resolve_external_target_location(&target_cls, &target_name).await;
+                let locs = self.resolve_external_target_location(&target_cls, &target_name, None).await;
                 if !locs.is_empty() {
                     return Ok(Self::into_definition_response(locs));
                 }
@@ -3121,7 +3180,7 @@ impl LanguageServer for JlspServer {
                     if info.receiver.is_some() {
                         if let Some(target_cls_name) = target_class.as_deref() {
                             if let Some(cls) = self.find_class_info(target_cls_name, current_pkg.as_deref(), &current_imports, &sem).await {
-                                let locs = self.resolve_external_target_location(&cls, &info.member_name).await;
+                                let locs = self.resolve_external_target_location(&cls, &info.member_name, info.arg_count).await;
                                 if !locs.is_empty() {
                                     return Ok(Self::into_definition_response(locs));
                                 }
@@ -3321,7 +3380,7 @@ impl LanguageServer for JlspServer {
                     } else {
                         &cls.simple_name
                     });
-                    let locs = self.resolve_external_target_location(&cls, name).await;
+                    let locs = self.resolve_external_target_location(&cls, name, None).await;
                     if !locs.is_empty() {
                         return Ok(Self::into_definition_response(locs));
                     }
@@ -3336,13 +3395,13 @@ impl LanguageServer for JlspServer {
                 return Ok(None);
             }
             if let Some(cls) = sem.resolve_type(word).await {
-                let locs = self.resolve_external_target_location(&cls, word).await;
+                let locs = self.resolve_external_target_location(&cls, word, None).await;
                 if !locs.is_empty() {
                     return Ok(Self::into_definition_response(locs));
                 }
             }
             for cls in self.classpath.find_classes_by_simple_name(word).await {
-                let locs = self.resolve_external_target_location(&cls, word).await;
+                let locs = self.resolve_external_target_location(&cls, word, None).await;
                 if !locs.is_empty() {
                     return Ok(Self::into_definition_response(locs));
                 }
@@ -3350,7 +3409,7 @@ impl LanguageServer for JlspServer {
             let common_jdk = crate::classpath::find_common_jdk_classes_by_name(word);
             for fqn in common_jdk {
                 if let Some(cls) = crate::classpath::get_builtin_jdk_class(&fqn) {
-                    let locs = self.resolve_external_target_location(&cls, word).await;
+                    let locs = self.resolve_external_target_location(&cls, word, None).await;
                     if !locs.is_empty() {
                         return Ok(Self::into_definition_response(locs));
                     }
@@ -6021,7 +6080,7 @@ impl LanguageServer for JlspServer {
                 }
                 crate::semantic::GotoTarget::External { cls, target_name } => {
                     let name = target_name.as_deref().unwrap_or(&cls.simple_name);
-                    let locs = self.resolve_external_target_location(&cls, name).await;
+                    let locs = self.resolve_external_target_location(&cls, name, None).await;
                     if !locs.is_empty() {
                         return Ok(Self::into_type_definition_response(locs));
                     }
@@ -6697,6 +6756,40 @@ impl LanguageServer for JlspServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_method_line_with_arity() {
+        let content = r#"
+public class ArrayList<E> {
+    private void add(E e, Object[] elementData, int s) {
+    }
+
+    public void add(int index, E element) {
+    }
+
+    public boolean add(E e) {
+        return true;
+    }
+
+    public boolean addAll(Collection<? extends E> c) {
+        return false;
+    }
+}
+"#;
+        // add(column1) -> 1 arg -> public boolean add(E e)
+        assert_eq!(find_method_line_with_arity(content, "add", Some(1)), 8);
+        // 2-arg overload
+        assert_eq!(find_method_line_with_arity(content, "add", Some(2)), 5);
+        // 3-arg private overload
+        assert_eq!(find_method_line_with_arity(content, "add", Some(3)), 2);
+        // no exact arity match -> generic fallback (first modifier-prefixed decl)
+        assert_eq!(find_method_line_with_arity(content, "add", Some(9)), 2);
+        // arity unknown -> generic fallback
+        assert_eq!(find_method_line_with_arity(content, "add", None), 2);
+        // generics with commas count correctly: addAll has 1 param
+        assert_eq!(find_method_line_with_arity(content, "addAll", Some(1)), 12);
+    }
+
     use crate::syntax::DiagnosticCode;
 
     #[tokio::test]
