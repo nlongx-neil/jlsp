@@ -286,7 +286,7 @@ impl MavenProject {
         }
 
         for dep in &self.dependencies {
-            let group_path = dep.group_id.replace('.', "/");
+            let group_path = dep.group_id.replace('.', std::path::MAIN_SEPARATOR_STR);
             if let Some(version) = &dep.version {
                 let jar_file_name = format!("{}-{}.jar", dep.artifact_id, version);
                 let candidate = m2_repo
@@ -390,7 +390,8 @@ impl MavenProject {
 
         for dep in &self.dependencies {
             if let Some(version) = &dep.version {
-                let group_path = dep.group_id.replace('.', "/");
+                // Filesystem path uses the OS separator; the download URL keeps `/`.
+                let group_path = dep.group_id.replace('.', std::path::MAIN_SEPARATOR_STR);
                 let jar_file_name = format!("{}-{}.jar", dep.artifact_id, version);
                 let target_path = m2_repo
                     .join(&group_path)
@@ -401,7 +402,7 @@ impl MavenProject {
                 if !target_path.exists() {
                     let remote_url = format!(
                         "https://repo1.maven.org/maven2/{}/{}/{}/{}",
-                        group_path, dep.artifact_id, version, jar_file_name
+                        dep.group_id.replace('.', "/"), dep.artifact_id, version, jar_file_name
                     );
                     info!("Missing dependency in ~/.m2, downloading from Maven Central: {}", remote_url);
 

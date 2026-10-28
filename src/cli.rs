@@ -153,7 +153,7 @@ impl CliChecker {
 
         // Search ~/.gradle/caches and the Maven local repository (honors ~/.m2/settings.xml)
         let search_dirs = [
-            dirs_home().map(|h| h.join(".gradle/caches")),
+            dirs_home().map(|h| h.join(".gradle").join("caches")),
             crate::project::maven::MavenProject::find_m2_repository(),
         ];
 

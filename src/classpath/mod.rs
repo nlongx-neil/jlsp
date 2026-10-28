@@ -885,11 +885,11 @@ pub fn dirs_home() -> Option<std::path::PathBuf> {
 /// Check if a directory is a valid JDK/JRE directory containing modules, rt.jar or src.zip
 pub fn is_valid_jdk_dir<P: AsRef<std::path::Path>>(p: P) -> bool {
     let path = p.as_ref();
-    path.join("lib/modules").exists()
-        || path.join("jre/lib/rt.jar").exists()
-        || path.join("lib/rt.jar").exists()
-        || path.join("Classes/classes.jar").exists()
-        || path.join("lib/src.zip").exists()
+    path.join("lib").join("modules").exists()
+        || path.join("jre").join("lib").join("rt.jar").exists()
+        || path.join("lib").join("rt.jar").exists()
+        || path.join("Classes").join("classes.jar").exists()
+        || path.join("lib").join("src.zip").exists()
         || path.join("src.zip").exists()
 }
 
@@ -938,7 +938,7 @@ pub fn find_java_home() -> Option<std::path::PathBuf> {
 
     // SDKMAN standard location
     if let Some(home) = dirs_home() {
-        candidates.push(home.join(".sdkman/candidates/java/current"));
+        candidates.push(home.join(".sdkman").join("candidates").join("java").join("current"));
     }
 
     // macOS /Library/Java/JavaVirtualMachines/*/Contents/Home

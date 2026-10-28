@@ -640,7 +640,7 @@ impl JlspServer {
         let base_cache_dir = base_dir.join(sub_dir_name);
 
         let pkg_path = if !target_cls.package_name.is_empty() {
-            target_cls.package_name.replace('.', "/")
+            target_cls.package_name.replace('.', std::path::MAIN_SEPARATOR_STR)
         } else {
             String::new()
         };
@@ -11483,7 +11483,8 @@ public class MapUtils {
 "#;
         // Simulate decompiled file opened from ~/.jlsp/decompiled/...
         let temp_dir = std::env::temp_dir().join(format!("jlsp_decomp_test_{}", std::process::id()));
-        let decompiled_path = temp_dir.join(".jlsp").join("decompiled").join("org/apache/commons/collections4/MapUtils.java");
+        let decompiled_path = temp_dir.join(".jlsp").join("decompiled")
+            .join("org").join("apache").join("commons").join("collections4").join("MapUtils.java");
         std::fs::create_dir_all(decompiled_path.parent().unwrap()).unwrap();
         std::fs::write(&decompiled_path, code).unwrap();
         let doc_uri = Url::from_file_path(&decompiled_path).unwrap();
