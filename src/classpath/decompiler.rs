@@ -2527,15 +2527,15 @@ pub fn extract_source_from_sources_jar(jar_path: &Path, fqn: &str) -> Option<Str
 
     let target_sources_jar = target_sources_jar.or_else(|| {
         // Fallback: search user's .m2 or .gradle caches for matching artifact sources jar
-        let home = std::env::var("HOME").ok().map(std::path::PathBuf::from)?;
+        let home = std::env::home_dir()?;
         let artifact_part = file_name.strip_suffix(".jar")?;
         let expected_name = format!("{}-sources.jar", artifact_part);
 
         let search_dirs = [
             crate::project::maven::MavenProject::find_m2_repository(),
-            home.join(".gradle/caches/modules-2/files-2.1"),
+            Some(home.join(".gradle/caches/modules-2/files-2.1")),
         ];
-        for base in search_dirs {
+        for base in search_dirs.into_iter().flatten() {
             if base.exists() {
                 for entry in walkdir::WalkDir::new(base).max_depth(6).into_iter().filter_map(|e| e.ok()) {
                     let p = entry.path();

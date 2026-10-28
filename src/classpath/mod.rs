@@ -876,7 +876,10 @@ impl ClasspathRegistry {
 }
 
 pub fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    // OS-level user home (e.g. macOS `/Users/<name>`). Never falls back to a
+    // relative path: returning None is always safer than writing into the
+    // process CWD (which is typically the opened project root).
+    std::env::home_dir()
 }
 
 /// Check if a directory is a valid JDK/JRE directory containing modules, rt.jar or src.zip

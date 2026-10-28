@@ -154,7 +154,7 @@ impl CliChecker {
         // Search ~/.gradle/caches and the Maven local repository (honors ~/.m2/settings.xml)
         let search_dirs = [
             dirs_home().map(|h| h.join(".gradle/caches")),
-            Some(crate::project::maven::MavenProject::find_m2_repository()),
+            crate::project::maven::MavenProject::find_m2_repository(),
         ];
 
         for dir_opt in search_dirs.into_iter().flatten() {
@@ -219,6 +219,6 @@ impl CliChecker {
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    std::env::home_dir()
 }
 

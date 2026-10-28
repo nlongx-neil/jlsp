@@ -292,9 +292,9 @@ impl GradleProject {
     /// or fallback to ~/.m2/repository
     pub fn resolve_local_jars(&self) -> Vec<PathBuf> {
         let mut jars = Vec::new();
-        let home = match std::env::var("HOME") {
-            Ok(h) => PathBuf::from(h),
-            Err(_) => return jars,
+        let home = match std::env::home_dir() {
+            Some(h) => h,
+            None => return jars,
         };
 
         // 1. Check ~/.gradle/caches/modules-2/files-2.1/<group>/<artifact>/<version>/*/jar
@@ -323,18 +323,22 @@ impl GradleProject {
                 }
             }
 
-            if !resolved && m2_repo.exists() {
-                let group_path = dep.group_id.replace('.', "/");
-                let jar_file_name = format!("{}-{}.jar", dep.artifact_id, dep.version);
-                let candidate = m2_repo
-                    .join(&group_path)
-                    .join(&dep.artifact_id)
-                    .join(&dep.version)
-                    .join(&jar_file_name);
+            if !resolved {
+                if let Some(ref repo) = m2_repo {
+                    if repo.exists() {
+                        let group_path = dep.group_id.replace('.', "/");
+                        let jar_file_name = format!("{}-{}.jar", dep.artifact_id, dep.version);
+                        let candidate = repo
+                            .join(&group_path)
+                            .join(&dep.artifact_id)
+                            .join(&dep.version)
+                            .join(&jar_file_name);
 
-                if candidate.exists() {
-                    info!("Resolved Gradle dependency via local .m2 fallback: {:?}", candidate);
-                    jars.push(candidate);
+                        if candidate.exists() {
+                            info!("Resolved Gradle dependency via local .m2 fallback: {:?}", candidate);
+                            jars.push(candidate);
+                        }
+                    }
                 }
             }
         }
