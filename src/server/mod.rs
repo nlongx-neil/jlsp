@@ -1048,8 +1048,15 @@ impl JlspServer {
                             if let Some(cls) = sem.local_classes.get(&enc) {
                                 for f in &cls.fields {
                                     if &f.name == name {
-                                        let fty = f.field_type.simple_name();
-                                        resolved = Some(fty.to_string());
+                                        // Prefer the concrete initializer type when the field is
+                                        // declared as an interface/abstract but constructed with a
+                                        // concrete class (`List<X> l = new ArrayList<>()`).
+                                        let fty = doc.ast.find_field_concrete_type(&enc, name)
+                                            .unwrap_or_else(|| {
+                                                let t = f.field_type.simple_name();
+                                                t.to_string()
+                                            });
+                                        resolved = Some(fty);
                                         break;
                                     }
                                 }

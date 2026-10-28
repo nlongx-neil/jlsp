@@ -5394,6 +5394,88 @@ impl JavaAst {
         Some((name, range))
     }
 
+    /// Prefer the concrete construction type over the declared (possibly
+    /// interface/abstract) type: `List<X> l = new ArrayList<>()` behaves as
+    /// ArrayList at runtime, so member navigation should land on ArrayList.
+    /// Diamond or raw constructions inherit the declared type arguments.
+    /// Returns the declared type unchanged when there is no `new` initializer.
+    fn prefer_initializer_type(&self, explicit_type: &str, declarator: &Node) -> String {
+        let init_node = match declarator.child_by_field_name("value") {
+            Some(n) if n.kind() == "object_creation_expression" => n,
+            _ => return explicit_type.to_string(),
+        };
+        let init_ty = match init_node.child_by_field_name("type") {
+            Some(t) => self.node_text(&t).to_string(),
+            None => return explicit_type.to_string(),
+        };
+        let init_base = init_ty.split('<').next().unwrap_or(&init_ty).trim();
+        if init_base.is_empty() {
+            return explicit_type.to_string();
+        }
+        if init_ty.contains('<') && !init_ty.trim_end().ends_with("<>") {
+            init_ty
+        } else if let Some(gidx) = explicit_type.find('<') {
+            format!("{}{}", init_base, &explicit_type[gidx..])
+        } else {
+            init_base.to_string()
+        }
+    }
+
+    /// If the field `field_name` in class `class_name` is declared with a
+    /// `new ConcreteType(...)` initializer, return that concrete type.
+    /// Returns None when the declared type should be used as-is.
+    pub fn find_field_concrete_type(&self, class_name: &str, field_name: &str) -> Option<String> {
+        fn visit(node: Node, ast: &JavaAst, class_name: &str, field_name: &str, out: &mut Option<String>) {
+            if out.is_some() {
+                return;
+            }
+            if node.kind() == "class_declaration" || node.kind() == "record_declaration" {
+                let matches = node
+                    .child_by_field_name("name")
+                    .map(|n| ast.node_text(&n) == class_name)
+                    .unwrap_or(false);
+                if matches {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        let mut cursor = body.walk();
+                        for member in body.children(&mut cursor) {
+                            if member.kind() != "field_declaration" {
+                                continue;
+                            }
+                            let f_type = member
+                                .child_by_field_name("type")
+                                .map(|t| ast.node_text(&t).to_string())
+                                .unwrap_or_default();
+                            let mut fc = member.walk();
+                            for dec in member.children(&mut fc) {
+                                if dec.kind() == "variable_declarator" {
+                                    if let Some(nn) = dec.child_by_field_name("name") {
+                                        if ast.node_text(&nn) == field_name {
+                                            let concrete = ast.prefer_initializer_type(&f_type, &dec);
+                                            if concrete != f_type && !concrete.is_empty() {
+                                                *out = Some(concrete);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                visit(child, ast, class_name, field_name, out);
+                if out.is_some() {
+                    return;
+                }
+            }
+        }
+        let mut out = None;
+        visit(self.tree.root_node(), self, class_name, field_name, &mut out);
+        out
+    }
+
     /// Extract local variables and parameters visible at the specified position
     /// Returns vector of (var_name, type_name_or_inferred)
     pub fn extract_local_variables_at_position(&self, line: u32, character: u32) -> Vec<(String, String)> {
@@ -5466,31 +5548,9 @@ impl JavaAst {
                                         resolved_type = "boolean".to_string();
                                     }
                                 }
-                            } else if let Some(init_node) = child.child_by_field_name("value") {
-                                // Prefer the concrete construction type over the declared type:
-                                // `List<X> l = new ArrayList<>()` behaves as ArrayList at runtime,
-                                // so member navigation (e.g. go-to-definition on `add`) should land
-                                // on ArrayList rather than the List interface.
-                                if init_node.kind() == "object_creation_expression" {
-                                    if let Some(ty_n) = init_node.child_by_field_name("type") {
-                                        let init_ty = ast.node_text(&ty_n).to_string();
-                                        let init_base = init_ty.split('<').next().unwrap_or(&init_ty).trim();
-                                        if !init_base.is_empty() {
-                                            let has_explicit_generics =
-                                                init_ty.contains('<') && !init_ty.trim_end().ends_with("<>");
-                                            if has_explicit_generics {
-                                                resolved_type = init_ty;
-                                            } else if let Some(gidx) = explicit_type.find('<') {
-                                                // Diamond or raw construction: inherit the declared
-                                                // type arguments (e.g. ArrayList<BizColumnInfoDto>).
-                                                resolved_type =
-                                                    format!("{}{}", init_base, &explicit_type[gidx..]);
-                                            } else {
-                                                resolved_type = init_base.to_string();
-                                            }
-                                        }
-                                    }
-                                }
+                            } else {
+                                // `List<X> l = new ArrayList<>()` -> resolve as ArrayList<X>
+                                resolved_type = ast.prefer_initializer_type(&explicit_type, &child);
                             }
 
                             out.push((var_name, resolved_type));
@@ -6813,6 +6873,38 @@ pub fn is_java_keyword(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_field_concrete_type_from_initializer() {
+        let code = r#"
+            import java.util.ArrayList;
+            import java.util.List;
+
+            public class B {
+                private List<BizColumnInfoDto> fieldList = new ArrayList<>();
+                private List<String> plain;
+                private Map<String, Integer> scores = new HashMap<>();
+
+                public void run() {
+                    fieldList.add(null);
+                }
+            }
+        "#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).expect("Should parse");
+        assert_eq!(
+            ast.find_field_concrete_type("B", "fieldList"),
+            Some("ArrayList<BizColumnInfoDto>".to_string())
+        );
+        assert_eq!(
+            ast.find_field_concrete_type("B", "scores"),
+            Some("HashMap<String, Integer>".to_string())
+        );
+        // No initializer -> declared type stays
+        assert_eq!(ast.find_field_concrete_type("B", "plain"), None);
+        // Unknown field / class -> None
+        assert_eq!(ast.find_field_concrete_type("B", "missing"), None);
+        assert_eq!(ast.find_field_concrete_type("Nope", "fieldList"), None);
+    }
 
     #[test]
     fn test_local_variable_prefers_concrete_initializer_type() {
