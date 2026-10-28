@@ -5466,6 +5466,31 @@ impl JavaAst {
                                         resolved_type = "boolean".to_string();
                                     }
                                 }
+                            } else if let Some(init_node) = child.child_by_field_name("value") {
+                                // Prefer the concrete construction type over the declared type:
+                                // `List<X> l = new ArrayList<>()` behaves as ArrayList at runtime,
+                                // so member navigation (e.g. go-to-definition on `add`) should land
+                                // on ArrayList rather than the List interface.
+                                if init_node.kind() == "object_creation_expression" {
+                                    if let Some(ty_n) = init_node.child_by_field_name("type") {
+                                        let init_ty = ast.node_text(&ty_n).to_string();
+                                        let init_base = init_ty.split('<').next().unwrap_or(&init_ty).trim();
+                                        if !init_base.is_empty() {
+                                            let has_explicit_generics =
+                                                init_ty.contains('<') && !init_ty.trim_end().ends_with("<>");
+                                            if has_explicit_generics {
+                                                resolved_type = init_ty;
+                                            } else if let Some(gidx) = explicit_type.find('<') {
+                                                // Diamond or raw construction: inherit the declared
+                                                // type arguments (e.g. ArrayList<BizColumnInfoDto>).
+                                                resolved_type =
+                                                    format!("{}{}", init_base, &explicit_type[gidx..]);
+                                            } else {
+                                                resolved_type = init_base.to_string();
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             out.push((var_name, resolved_type));
@@ -6788,6 +6813,28 @@ pub fn is_java_keyword(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_local_variable_prefers_concrete_initializer_type() {
+        let code = r#"
+            import java.util.ArrayList;
+            import java.util.List;
+
+            public class B {
+                public void run() {
+                    List<BizColumnInfoDto> columnList = new ArrayList<>();
+                    BizColumnInfoDto column1 = new BizColumnInfoDto();
+                    columnList.add(column1);
+                }
+            }
+        "#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).expect("Should parse");
+        // Position inside the method body, after the declaration
+        let locals = ast.extract_local_variables_at_position(8, 30);
+        let col = locals.iter().find(|(n, _)| n == "columnList").expect("columnList");
+        // Declared interface + diamond initializer -> concrete type with declared type args
+        assert_eq!(col.1, "ArrayList<BizColumnInfoDto>");
+    }
 
     #[test]
     fn test_ast_parsing() {
