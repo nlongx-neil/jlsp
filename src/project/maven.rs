@@ -169,19 +169,46 @@ impl MavenProject {
         jars
     }
 
-    /// Locate the local Maven repository path, honoring ~/.m2/settings.xml if present
-    pub fn find_m2_repository() -> PathBuf {
-        let home = match std::env::var("HOME") {
-            Ok(h) => PathBuf::from(h),
-            Err(_) => return PathBuf::from(".m2/repository"),
-        };
-        let settings_path = home.join(".m2").join("settings.xml");
-        if let Ok(content) = fs::read_to_string(&settings_path) {
+    /// Locate the local Maven repository path.
+    ///
+    /// Resolution order, mirroring Maven:
+    /// 1. `<localRepository>` in the user-level `~/.m2/settings.xml`
+    /// 2. `<localRepository>` in the global `$MAVEN_HOME/conf/settings.xml`
+    ///    (or `$M2_HOME/conf/settings.xml`)
+    /// 3. `~/.m2/repository` under the OS-level user home (e.g. macOS
+    ///    `/Users/<name>`, Linux `/home/<name>`)
+    ///
+    /// Returns `None` when the OS user home directory cannot be determined. A
+    /// relative fallback must never be used: it would resolve against the
+    /// process working directory (typically the opened project root) and create
+    /// a stray `.m2/repository` there.
+    pub fn find_m2_repository() -> Option<PathBuf> {
+        let home = std::env::home_dir()?;
+
+        // 1. User-level settings: ~/.m2/settings.xml
+        if let Ok(content) = fs::read_to_string(home.join(".m2").join("settings.xml")) {
             if let Some(p) = Self::parse_local_repository(&content, &home) {
-                return p;
+                return Some(p);
             }
         }
-        home.join(".m2").join("repository")
+
+        // 2. Global settings from the Maven installation directory.
+        for var in ["MAVEN_HOME", "M2_HOME"] {
+            if let Ok(dir) = std::env::var(var) {
+                if dir.is_empty() {
+                    continue;
+                }
+                let global = PathBuf::from(dir).join("conf").join("settings.xml");
+                if let Ok(content) = fs::read_to_string(global) {
+                    if let Some(p) = Self::parse_local_repository(&content, &home) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+
+        // 3. Default: <user home>/.m2/repository
+        Some(home.join(".m2").join("repository"))
     }
 
     /// Extract `<localRepository>` from settings.xml content.
@@ -250,7 +277,10 @@ impl MavenProject {
     /// Locate jar files in local Maven repository (~/.m2/repository), including test scope
     pub fn resolve_local_jars(&self) -> Vec<PathBuf> {
         let mut jars = Vec::new();
-        let m2_repo = Self::find_m2_repository();
+        let m2_repo = match Self::find_m2_repository() {
+            Some(p) => p,
+            None => return jars,
+        };
         if !m2_repo.exists() {
             return jars;
         }
@@ -351,7 +381,12 @@ impl MavenProject {
     /// Resolve jars locally or download from Maven Central if missing (including test scope)
     pub async fn resolve_and_download_jars(&self) -> Vec<PathBuf> {
         let mut jars = self.resolve_local_jars();
-        let m2_repo = Self::find_m2_repository();
+        // Without a determinable local repository, downloading is skipped entirely
+        // (it would otherwise write into a stray relative path).
+        let m2_repo = match Self::find_m2_repository() {
+            Some(p) => p,
+            None => return jars,
+        };
 
         for dep in &self.dependencies {
             if let Some(version) = &dep.version {
