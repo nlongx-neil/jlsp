@@ -50,8 +50,9 @@ pub fn is_ignored_entry(entry: &walkdir::DirEntry) -> bool {
         let name = entry.file_name().to_string_lossy();
         if matches!(
             name.as_ref(),
-            ".git" | ".svn" | ".hg" | "node_modules" | ".gradle" | ".idea" | ".vscode" | ".settings" | ".mvn"
+            ".git" | ".svn" | ".hg" | ".jlsp" | "node_modules" | ".gradle" | ".idea" | ".vscode" | ".settings" | ".mvn"
                 | "classes" | "test-classes" | "intermediates"
+                | "target" | "build" | "bin" | "out" | "dist" | ".metadata"
         ) {
             return true;
         }
@@ -359,7 +360,12 @@ impl WorkspaceIndex {
             return false;
         }
         if let Ok(bytes) = fs::read(cache_file) {
-            if let Ok(symbols) = bincode::deserialize::<Vec<SourceSymbol>>(&bytes) {
+            let decompressed = if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+                zstd::decode_all(&bytes[..]).unwrap_or_else(|_| bytes.clone())
+            } else {
+                bytes
+            };
+            if let Ok(symbols) = bincode::deserialize::<Vec<SourceSymbol>>(&decompressed) {
                 let mut fqn_map = self.symbols_by_fqn.write().await;
                 let mut name_map = self.symbols_by_simple_name.write().await;
                 for sym in symbols {
@@ -382,7 +388,8 @@ impl WorkspaceIndex {
         let fqn_map = self.symbols_by_fqn.read().await;
         let symbols: Vec<SourceSymbol> = fqn_map.values().cloned().collect();
         if let Ok(encoded) = bincode::serialize(&symbols) {
-            let _ = fs::write(cache_file, encoded);
+            let payload = zstd::encode_all(&encoded[..], 3).unwrap_or(encoded);
+            let _ = fs::write(cache_file, payload);
             info!("Persisted {} symbols to disk cache: {:?}", symbols.len(), cache_file);
         }
     }
@@ -498,6 +505,11 @@ impl WorkspaceIndex {
             .filter(|s| Self::matches_query(&s.simple_name, &s.fqn, query))
             .cloned()
             .collect()
+    }
+
+    pub async fn with_symbols<R, F: FnOnce(&HashMap<String, SourceSymbol>) -> R>(&self, f: F) -> R {
+        let fqn_map = self.symbols_by_fqn.read().await;
+        f(&fqn_map)
     }
 
     pub async fn all_symbols(&self) -> Vec<SourceSymbol> {

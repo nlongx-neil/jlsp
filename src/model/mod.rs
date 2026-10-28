@@ -66,6 +66,39 @@ pub struct MethodInfo {
     pub body: Option<String>,
 }
 
+impl MethodInfo {
+    #[inline]
+    pub fn has_body(&self) -> bool {
+        self.body.is_some()
+    }
+
+    /// Returns parameter name or fallback "arg{idx}" if name is empty
+    pub fn parameter_name(&self, idx: usize) -> String {
+        if let Some((name, _)) = self.parameters.get(idx) {
+            if !name.is_empty() {
+                return name.clone();
+            }
+        }
+        format!("arg{}", idx)
+    }
+
+    /// Formats parameter display string e.g. "String name" or "int arg0"
+    pub fn parameter_display_strings(&self) -> Vec<String> {
+        self.parameters
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, typ))| {
+                let p_name = if name.is_empty() {
+                    format!("arg{}", idx)
+                } else {
+                    name.clone()
+                };
+                format!("{} {}", typ.simple_name(), p_name)
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldInfo {
     pub name: String,
@@ -118,4 +151,34 @@ pub struct SymbolDef {
     pub selection_range: Range,
     pub detail: Option<String>,
     pub container_name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_method_info_parameter_fallback() {
+        let m = MethodInfo {
+            name: "calculate".to_string(),
+            return_type: TypeSignature::Int,
+            parameters: vec![
+                ("".to_string(), TypeSignature::Int),
+                ("factor".to_string(), TypeSignature::Class("java.lang.String".to_string())),
+                ("".to_string(), TypeSignature::Boolean),
+            ],
+            is_static: false,
+            is_public: true,
+            is_constructor: false,
+            javadoc: None,
+            body: None,
+        };
+
+        assert_eq!(m.parameter_name(0), "arg0");
+        assert_eq!(m.parameter_name(1), "factor");
+        assert_eq!(m.parameter_name(2), "arg2");
+
+        let displays = m.parameter_display_strings();
+        assert_eq!(displays, vec!["int arg0", "String factor", "boolean arg2"]);
+    }
 }

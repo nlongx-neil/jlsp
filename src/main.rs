@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod cli;
 pub mod classpath;
 pub mod indexer;

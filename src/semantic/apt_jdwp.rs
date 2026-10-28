@@ -44,6 +44,76 @@ impl JdwpClient {
             Err("Invalid JDWP handshake response from JVM".into())
         }
     }
+
+    /// Resolve valid executable lines for setting DAP breakpoints in Java source code
+    pub fn resolve_valid_breakpoint_lines(source_text: &str) -> Vec<u32> {
+        let mut valid_lines = Vec::new();
+        let mut in_block_comment = false;
+
+        for (idx, raw_line) in source_text.lines().enumerate() {
+            let line = raw_line.trim();
+            let line_num = idx as u32;
+
+            if in_block_comment {
+                if line.contains("*/") {
+                    in_block_comment = false;
+                }
+                continue;
+            }
+
+            if line.starts_with("/*") {
+                if !line.contains("*/") {
+                    in_block_comment = true;
+                }
+                continue;
+            }
+
+            if line.is_empty()
+                || line.starts_with("//")
+                || line.starts_with('*')
+                || line.starts_with("package ")
+                || line.starts_with("import ")
+                || line.starts_with('@')
+                || line == "{"
+                || line == "}"
+                || line.starts_with("public class ")
+                || line.starts_with("class ")
+                || line.starts_with("public interface ")
+                || line.starts_with("interface ")
+                || line.starts_with("public enum ")
+                || line.starts_with("enum ")
+            {
+                continue;
+            }
+
+            // Line contains executable statement or assignment
+            if line.ends_with(';') || line.ends_with('{') || line.contains("return ") || line.contains("if ") || line.contains("for ") || line.contains("while ") {
+                valid_lines.push(line_num);
+            }
+        }
+
+        valid_lines
+    }
+
+    /// Construct standard DAP launch configuration arguments
+    pub fn get_dap_launch_arguments(
+        main_class: &str,
+        classpaths: &[String],
+        vm_args: &[String],
+        program_args: &[String],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "java",
+            "request": "launch",
+            "name": format!("Launch {}", main_class),
+            "mainClass": main_class,
+            "classPaths": classpaths,
+            "vmArgs": vm_args.join(" "),
+            "args": program_args.join(" "),
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false
+        })
+    }
 }
 
 /// Discovered Annotation Processor information from JAR files or SPI metadata

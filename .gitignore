@@ -1,6 +1,6 @@
 /target
 dist
-docs
+!docs/JDT_LS_COMPARISON.md
 .github
 Cargo.lock
 .DS_Store

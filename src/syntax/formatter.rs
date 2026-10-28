@@ -1,7 +1,11 @@
-/// Java source code formatter
+/// Java source code formatter with Eclipse XML profile support
+#[derive(Debug, Clone)]
 pub struct JavaFormatter {
     pub tab_size: usize,
     pub insert_spaces: bool,
+    pub brace_position_next_line: bool,
+    pub insert_space_after_comma: bool,
+    pub max_consecutive_blank_lines: usize,
 }
 
 impl Default for JavaFormatter {
@@ -9,6 +13,9 @@ impl Default for JavaFormatter {
         Self {
             tab_size: 4,
             insert_spaces: true,
+            brace_position_next_line: false,
+            insert_space_after_comma: true,
+            max_consecutive_blank_lines: 2,
         }
     }
 }
@@ -18,6 +25,9 @@ impl JavaFormatter {
         Self {
             tab_size,
             insert_spaces,
+            brace_position_next_line: false,
+            insert_space_after_comma: true,
+            max_consecutive_blank_lines: 2,
         }
     }
 
@@ -25,6 +35,9 @@ impl JavaFormatter {
     pub fn load_from_eclipse_xml(xml_content: &str) -> Self {
         let mut tab_size = 4;
         let mut insert_spaces = true;
+        let mut brace_position_next_line = false;
+        let mut insert_space_after_comma = true;
+        let mut max_consecutive_blank_lines = 2;
 
         for line in xml_content.lines() {
             if line.contains("org.eclipse.jdt.core.formatter.tabulation.size") {
@@ -42,12 +55,41 @@ impl JavaFormatter {
                 } else if line.contains("value=\"tab\"") {
                     insert_spaces = false;
                 }
+            } else if line.contains("org.eclipse.jdt.core.formatter.brace_position_for_type_declaration")
+                || line.contains("org.eclipse.jdt.core.formatter.brace_position_for_method_declaration")
+                || line.contains("org.eclipse.jdt.core.formatter.brace_position_for_block")
+            {
+                if line.contains("value=\"next_line\"") {
+                    brace_position_next_line = true;
+                } else if line.contains("value=\"end_of_line\"") || line.contains("value=\"same_line\"") {
+                    brace_position_next_line = false;
+                }
+            } else if line.contains("org.eclipse.jdt.core.formatter.insert_space_after_comma_in_method_invocation_arguments")
+                || line.contains("org.eclipse.jdt.core.formatter.insert_space_after_comma_in_method_declaration_parameters")
+            {
+                if line.contains("value=\"insert\"") || line.contains("value=\"true\"") {
+                    insert_space_after_comma = true;
+                } else if line.contains("value=\"do not insert\"") || line.contains("value=\"false\"") {
+                    insert_space_after_comma = false;
+                }
+            } else if line.contains("org.eclipse.jdt.core.formatter.number_of_empty_lines_to_preserve") {
+                if let Some(val_idx) = line.find("value=\"") {
+                    let rest = &line[val_idx + 7..];
+                    if let Some(end_idx) = rest.find('"') {
+                        if let Ok(num) = rest[..end_idx].parse::<usize>() {
+                            max_consecutive_blank_lines = num;
+                        }
+                    }
+                }
             }
         }
 
         Self {
             tab_size,
             insert_spaces,
+            brace_position_next_line,
+            insert_space_after_comma,
+            max_consecutive_blank_lines,
         }
     }
 
@@ -62,14 +104,19 @@ impl JavaFormatter {
 
         let mut in_block_comment = false;
         let mut in_text_block = false;
+        let mut blank_line_count = 0;
 
         for raw_line in source.lines() {
             let line = raw_line.trim();
 
             if line.is_empty() {
-                result.push('\n');
+                blank_line_count += 1;
+                if blank_line_count <= self.max_consecutive_blank_lines {
+                    result.push('\n');
+                }
                 continue;
             }
+            blank_line_count = 0;
 
             // Count leading closing braces that reduce this line's indent
             let mut leading_close = 0;
@@ -256,5 +303,24 @@ int x = 42;
 }
 "#;
         assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn test_format_eclipse_xml_extended_options() {
+        let xml = r#"
+            <setting id="org.eclipse.jdt.core.formatter.tabulation.size" value="2"/>
+            <setting id="org.eclipse.jdt.core.formatter.tabulation.char" value="space"/>
+            <setting id="org.eclipse.jdt.core.formatter.brace_position_for_type_declaration" value="next_line"/>
+            <setting id="org.eclipse.jdt.core.formatter.number_of_empty_lines_to_preserve" value="1"/>
+        "#;
+        let formatter = JavaFormatter::load_from_eclipse_xml(xml);
+        assert_eq!(formatter.tab_size, 2);
+        assert!(formatter.insert_spaces);
+        assert!(formatter.brace_position_next_line);
+        assert_eq!(formatter.max_consecutive_blank_lines, 1);
+
+        let unformatted = "public class A {\n\n\n\n  int x = 1;\n}";
+        let formatted = formatter.format(unformatted);
+        assert!(!formatted.contains("\n\n\n"));
     }
 }

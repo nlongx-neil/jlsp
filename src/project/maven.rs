@@ -169,14 +169,71 @@ impl MavenProject {
         jars
     }
 
+    /// Locate the local Maven repository path, honoring ~/.m2/settings.xml if present
+    pub fn find_m2_repository() -> PathBuf {
+        let home = match std::env::var("HOME") {
+            Ok(h) => PathBuf::from(h),
+            Err(_) => return PathBuf::from(".m2/repository"),
+        };
+        let settings_path = home.join(".m2").join("settings.xml");
+        if settings_path.exists() {
+            if let Ok(content) = fs::read_to_string(&settings_path) {
+                if let Some(start) = content.find("<localRepository>") {
+                    if let Some(end) = content[start..].find("</localRepository>") {
+                        let custom_path = content[start + 17..start + end].trim();
+                        if !custom_path.is_empty() {
+                            let p = PathBuf::from(custom_path);
+                            if p.exists() {
+                                return p;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        home.join(".m2").join("repository")
+    }
+
+    /// Resolve scoped jars: (compile_and_runtime_jars, test_scoped_jars)
+    pub fn resolve_scoped_jars(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let all_jars = self.resolve_local_jars();
+        let mut compile_jars = Vec::new();
+        let mut test_jars = Vec::new();
+
+        for dep in &self.dependencies {
+            let is_test = dep.scope.as_deref() == Some("test");
+            let file_pattern = format!("{}-", dep.artifact_id);
+            for jar in &all_jars {
+                if let Some(file_name) = jar.file_name().and_then(|n| n.to_str()) {
+                    if file_name.starts_with(&file_pattern) {
+                        if is_test {
+                            if !test_jars.contains(jar) {
+                                test_jars.push(jar.clone());
+                            }
+                        } else {
+                            if !compile_jars.contains(jar) {
+                                compile_jars.push(jar.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add any remaining jars to compile_jars
+        for jar in all_jars {
+            if !test_jars.contains(&jar) && !compile_jars.contains(&jar) {
+                compile_jars.push(jar);
+            }
+        }
+
+        (compile_jars, test_jars)
+    }
+
     /// Locate jar files in local Maven repository (~/.m2/repository), including test scope
     pub fn resolve_local_jars(&self) -> Vec<PathBuf> {
         let mut jars = Vec::new();
-        let home = match std::env::var("HOME") {
-            Ok(h) => PathBuf::from(h),
-            Err(_) => return jars,
-        };
-        let m2_repo = home.join(".m2").join("repository");
+        let m2_repo = Self::find_m2_repository();
         if !m2_repo.exists() {
             return jars;
         }

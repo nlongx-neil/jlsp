@@ -39,29 +39,21 @@ pub fn parse_class_bytes(bytes: &[u8]) -> Result<ClassInfo, String> {
         let (param_types, return_type) = parse_method_descriptor(&desc_str);
         let params: Vec<(String, TypeSignature)> = param_types
             .iter()
-            .enumerate()
-            .map(|(idx, ty)| (format!("arg{idx}"), ty.clone()))
+            .map(|ty| (String::new(), ty.clone()))
             .collect();
 
         let is_static = m.access_flags.contains(MethodAccessFlags::STATIC);
         let is_public = m.access_flags.contains(MethodAccessFlags::PUBLIC);
+        let raw_abstract = m.access_flags.contains(MethodAccessFlags::ABSTRACT);
         let is_constructor = m.name == "<init>";
 
-        let mut decompiled_body = None;
+        let mut has_code_attr = false;
         let mut real_params = Vec::new();
 
         for attr in &m.attributes {
             if let cafebabe::attributes::AttributeData::Code(ref code_data) = attr.data {
-                decompiled_body = crate::classpath::decompiler::decompile_code_data(
-                    &m.name,
-                    &desc_str,
-                    is_static,
-                    is_constructor,
-                    &simple_name,
-                    code_data,
-                );
-
-                // Extract real parameter names from LocalVariableTable if present
+                has_code_attr = true;
+                // Extract real parameter names from LocalVariableTable if present (fast metadata only, 0 decompilation overhead)
                 for c_attr in &code_data.attributes {
                     if let cafebabe::attributes::AttributeData::LocalVariableTable(ref entries) = c_attr.data {
                         let mut slot = if is_static { 0 } else { 1 };
@@ -81,6 +73,14 @@ pub fn parse_class_bytes(bytes: &[u8]) -> Result<ClassInfo, String> {
             }
         }
 
+        let is_abstract = raw_abstract || (!has_code_attr && !is_static && !is_constructor);
+        let body = if is_abstract {
+            None
+        } else {
+            // Zero-allocation empty string placeholder to indicate concrete method without holding megabytes of decompiled source
+            Some(String::new())
+        };
+
         let final_params = if real_params.len() == params.len() {
             real_params
         } else {
@@ -95,7 +95,7 @@ pub fn parse_class_bytes(bytes: &[u8]) -> Result<ClassInfo, String> {
             is_public,
             is_constructor,
             javadoc: None,
-            body: decompiled_body,
+            body,
         });
     }
 
@@ -134,6 +134,7 @@ pub fn parse_jar_file<P: AsRef<Path>>(jar_path: P) -> Result<Vec<ClassInfo>, Str
     let file = File::open(&jar_path).map_err(|e| format!("Cannot open jar {}: {e}", jar_path.as_ref().display()))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Zip error: {e}"))?;
 
+    let jar_path_str = jar_path.as_ref().to_string_lossy().to_string();
     let mut classes = Vec::new();
 
     for i in 0..archive.len() {
@@ -147,7 +148,7 @@ pub fn parse_jar_file<P: AsRef<Path>>(jar_path: P) -> Result<Vec<ClassInfo>, Str
             let mut buf = Vec::with_capacity(entry.size() as usize);
             if entry.read_to_end(&mut buf).is_ok()
                 && let Ok(mut class_info) = parse_class_bytes(&buf) {
-                    class_info.source_path = Some(jar_path.as_ref().to_string_lossy().to_string());
+                    class_info.source_path = Some(jar_path_str.clone());
                     classes.push(class_info);
                 }
         }

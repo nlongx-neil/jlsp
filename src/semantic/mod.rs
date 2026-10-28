@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::classpath::ClasspathRegistry;
-use crate::model::{ClassInfo, MethodInfo, Range};
+use crate::model::{ClassInfo, ClassKind, MethodInfo, Range};
 use crate::syntax::JavaAst;
 
 pub struct SemanticContext<'a> {
@@ -85,6 +85,9 @@ impl<'a> SemanticContext<'a> {
 
         // Extract simple name for fallback (handles "pkg.Foo" as well as syntax recovery "Foo.\n Foo")
         let simple_name = type_name.split_whitespace().last().unwrap_or(type_name).split('.').last().unwrap_or(type_name);
+        if !crate::syntax::is_valid_java_identifier(simple_name) {
+            return None;
+        }
 
         // 2. Check local classes in current file
         if let Some(cls) = self.local_classes.get(type_name).or_else(|| self.local_classes.get(simple_name)) {
@@ -183,6 +186,9 @@ impl<'a> SemanticContext<'a> {
         if let Some(cls) = self.classpath.get_class(&java_lang_fqn).await {
             return Some(cls);
         }
+        if let Some(cls) = crate::classpath::get_builtin_jdk_class(&java_lang_fqn) {
+            return Some(Arc::new(cls));
+        }
 
         // 6. Search registry by simple name
         let found = self.classpath.find_classes_by_simple_name(simple_name).await;
@@ -203,6 +209,9 @@ impl<'a> SemanticContext<'a> {
             if let Some(cls) = crate::classpath::get_builtin_jdk_class(&fqn) {
                 return Some(Arc::new(cls));
             }
+        }
+        if let Some(cls) = crate::classpath::get_builtin_jdk_class_by_simple_name(simple_name) {
+            return Some(Arc::new(cls));
         }
         if let Some(cls) = crate::classpath::get_builtin_framework_class_by_simple_name(simple_name) {
             return Some(Arc::new(cls));
@@ -337,33 +346,126 @@ impl<'a> SemanticContext<'a> {
     /// Find missing interface/abstract methods that need to be implemented for local classes
     pub async fn find_missing_abstract_methods(&self) -> Vec<(String, Vec<crate::model::MethodInfo>)> {
         let mut missing_by_class = Vec::new();
+        let mut seen_fqns = std::collections::HashSet::new();
+
+        let is_object_method = |name: &str| -> bool {
+            matches!(
+                name,
+                "<init>"
+                    | "<clinit>"
+                    | "registerNatives"
+                    | "getClass"
+                    | "hashCode"
+                    | "equals"
+                    | "clone"
+                    | "toString"
+                    | "notify"
+                    | "notifyAll"
+                    | "wait"
+                    | "finalize"
+            )
+        };
 
         for cls in self.local_classes.values() {
+            // Deduplicate local classes (since local_classes maps both simple_name and fqn)
+            if !seen_fqns.insert(cls.fqn.clone()) {
+                continue;
+            }
+
+            // Interfaces, annotations, and enums don't need to implement abstract methods
+            if cls.kind == ClassKind::Interface || cls.kind == ClassKind::Annotation || cls.kind == ClassKind::Enum {
+                continue;
+            }
+
+            // Skip classes explicitly declared abstract in source AST (including nested/inner classes)
+            fn is_class_abstract(node: tree_sitter::Node, ast: &crate::syntax::JavaAst, target: &str) -> bool {
+                if matches!(node.kind(), "class_declaration" | "record_declaration" | "interface_declaration" | "enum_declaration") {
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        if ast.node_text(&name_node) == target {
+                            return node.child_by_field_name("modifiers")
+                                .map(|m| ast.node_text(&m).contains("abstract"))
+                                .unwrap_or(false);
+                        }
+                    }
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if is_class_abstract(child, ast, target) {
+                        return true;
+                    }
+                }
+                false
+            }
+            if is_class_abstract(self.ast.tree.root_node(), self.ast, &cls.simple_name) {
+                continue;
+            }
+
+            // If super class is external and unresolved, avoid false positives on interface methods
+            // that the unknown superclass may already implement
+            let mut super_class_unresolved = false;
+            if let Some(super_name) = &cls.super_class {
+                if super_name != "java.lang.Object" && super_name != "java/lang/Object" && super_name != "Object" {
+                    if self.resolve_type(super_name).await.is_none() {
+                        super_class_unresolved = true;
+                    }
+                }
+            }
+            if super_class_unresolved {
+                continue;
+            }
+
             let mut required_methods = Vec::new();
 
             for iface in &cls.interfaces {
                 if let Some(iface_info) = self.resolve_type(iface).await {
                     let inherited = self.get_all_methods_with_inheritance(&iface_info).await;
-                    required_methods.extend(inherited);
+                    for m in inherited {
+                        // Skip static methods, default methods (with body), constructors, and Object methods
+                        if m.is_static || m.is_constructor || is_object_method(&m.name) || m.has_body() {
+                            continue;
+                        }
+                        required_methods.push(m);
+                    }
                 }
             }
 
             if let Some(super_name) = &cls.super_class {
-                if let Some(super_info) = self.resolve_type(super_name).await {
-                    for m in &super_info.methods {
-                        // Check if method is abstract or not implemented
-                        if !cls.methods.iter().any(|cm| cm.name == m.name) {
-                            required_methods.push(m.clone());
+                if super_name != "java.lang.Object" && super_name != "java/lang/Object" && super_name != "Object" {
+                    if let Some(super_info) = self.resolve_type(super_name).await {
+                        // Only abstract methods without bodies in abstract superclasses are required
+                        for m in &super_info.methods {
+                            if !m.is_static && !m.is_constructor && !is_object_method(&m.name) && !m.has_body() {
+                                required_methods.push(m.clone());
+                            }
                         }
                     }
                 }
             }
 
-            // Filter out methods already implemented in cls
+            // Collect all available methods from cls and its superclass hierarchy
+            let mut available_methods = cls.methods.clone();
+            let mut curr_super = cls.super_class.clone();
+            while let Some(super_name) = curr_super {
+                if super_name == "java.lang.Object" || super_name == "java/lang/Object" || super_name == "Object" {
+                    break;
+                }
+                if let Some(super_info) = self.resolve_type(&super_name).await {
+                    for m in &super_info.methods {
+                        if !m.is_static && !m.is_constructor && m.has_body() {
+                            available_methods.push(m.clone());
+                        }
+                    }
+                    curr_super = super_info.super_class.clone();
+                } else {
+                    break;
+                }
+            }
+
+            // Filter out methods already implemented in cls or superclasses (comparing name and parameter count)
             let mut missing = Vec::new();
             for req in required_methods {
-                if !cls.methods.iter().any(|cm| cm.name == req.name) {
-                    if !missing.iter().any(|m: &crate::model::MethodInfo| m.name == req.name) {
+                if !available_methods.iter().any(|cm| cm.name == req.name && cm.parameters.len() == req.parameters.len()) {
+                    if !missing.iter().any(|m: &crate::model::MethodInfo| m.name == req.name && m.parameters.len() == req.parameters.len()) {
                         missing.push(req);
                     }
                 }
@@ -481,8 +583,11 @@ impl<'a> SemanticContext<'a> {
                 let mut target_class_name: Option<String> = None;
 
                 if let Some(recv) = recv_opt {
-                    if recv == "this" || recv == "super" {
+                    if recv == "this" {
                         target_class_name = self.ast.find_enclosing_class_at_position(line, character);
+                    } else if recv == "super" {
+                        let enc = self.ast.find_enclosing_class_at_position(line, character);
+                        target_class_name = enc.and_then(|e| self.local_classes.get(&e).and_then(|c| c.super_class.clone()));
                     } else {
                         // Check local variables / parameters
                         let locals = self.ast.extract_local_variables_at_position(line, character);
@@ -551,6 +656,47 @@ impl<'a> SemanticContext<'a> {
                                     if sym.name == field_cand && sym.container_name.as_deref() == Some(&local_cls.simple_name) {
                                         return Some(GotoTarget::Local(sym.selection_range));
                                     }
+                                }
+                            }
+
+                            // If not found directly in local class, search inherited methods from superclasses/interfaces
+                            let mut queue = Vec::new();
+                            if let Some(ref sc) = local_cls.super_class {
+                                queue.push(sc.clone());
+                            }
+                            queue.extend(local_cls.interfaces.clone());
+
+                            let mut visited = std::collections::HashSet::new();
+                            while let Some(ancestor_name) = queue.pop() {
+                                if !visited.insert(ancestor_name.clone()) {
+                                    continue;
+                                }
+                                if let Some(ancestor_info) = self.resolve_type(&ancestor_name).await {
+                                    if ancestor_info.methods.iter().any(|m| m.name == m_name) {
+                                        if let Some(ref sp) = ancestor_info.source_path {
+                                            if sp.ends_with(".java") && std::path::Path::new(sp).exists() {
+                                                let mut line = 0;
+                                                if let Ok(content) = std::fs::read_to_string(sp) {
+                                                    line = crate::syntax::find_target_line_in_source(&content, &m_name);
+                                                }
+                                                return Some(GotoTarget::SourceFile {
+                                                    path: sp.clone(),
+                                                    range: Range {
+                                                        start: crate::model::Position { line, character: 0 },
+                                                        end: crate::model::Position { line, character: m_name.len() as u32 },
+                                                    },
+                                                });
+                                            }
+                                        }
+                                        return Some(GotoTarget::External {
+                                            cls: ancestor_info,
+                                            target_name: Some(m_name.clone()),
+                                        });
+                                    }
+                                    if let Some(ref sc) = ancestor_info.super_class {
+                                        queue.push(sc.clone());
+                                    }
+                                    queue.extend(ancestor_info.interfaces.clone());
                                 }
                             }
                         } else {
@@ -770,7 +916,7 @@ impl<'a> SemanticContext<'a> {
                     ret_display = arg.clone();
                 }
             }
-            let param_labels: Vec<String> = m.parameters.iter().map(|(p, t)| format!("{} {}", t.simple_name(), p)).collect();
+            let param_labels = m.parameter_display_strings();
             items.push(CompletionItem {
                 label: m.name.clone(),
                 kind: CompletionKind::Method,

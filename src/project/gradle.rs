@@ -268,6 +268,26 @@ impl GradleProject {
         libraries
     }
 
+    /// Resolve scoped jars: (compile_and_runtime_jars, test_scoped_jars)
+    pub fn resolve_scoped_jars(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let all_jars = self.resolve_local_jars();
+        let mut compile_jars = Vec::new();
+        let mut test_jars = Vec::new();
+
+        for jar in all_jars {
+            let name = jar.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.contains("junit") || name.contains("mockito") || name.contains("assertj") || name.contains("-test") {
+                if !test_jars.contains(&jar) {
+                    test_jars.push(jar);
+                }
+            } else if !compile_jars.contains(&jar) {
+                compile_jars.push(jar);
+            }
+        }
+
+        (compile_jars, test_jars)
+    }
+
     /// Resolve jar files from Gradle local cache (~/.gradle/caches/modules-2/files-2.1/)
     /// or fallback to ~/.m2/repository
     pub fn resolve_local_jars(&self) -> Vec<PathBuf> {

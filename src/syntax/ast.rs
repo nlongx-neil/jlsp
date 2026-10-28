@@ -57,6 +57,8 @@ pub enum DiagnosticCode {
     StaticMemberViaInstance,
     UnusedParameter,
     StringConcatInLoop,
+    DeprecatedUsage,
+    MissingSerialVersionUid,
 }
 
 impl DiagnosticCode {
@@ -81,6 +83,8 @@ impl DiagnosticCode {
             DiagnosticCode::UnusedParameter => "compiler.warn.unused.parameter",
             DiagnosticCode::StringConcatInLoop => "performance.warn.string.concat.in.loop",
             DiagnosticCode::UnimplementedAbstractMethod => "compiler.err.does.not.override.abstract",
+            DiagnosticCode::DeprecatedUsage => "compiler.warn.deprecated",
+            DiagnosticCode::MissingSerialVersionUid => "compiler.warn.missing.serial.version.uid",
             DiagnosticCode::UnresolvedImport => "compiler.err.cant.resolve",
             DiagnosticCode::PublicClassNameMismatch => "compiler.err.public.class.must.be.in.file",
             DiagnosticCode::UninitializedVariable => "compiler.err.var.might.not.have.been.initialized",
@@ -101,6 +105,8 @@ impl DiagnosticCode {
                 | DiagnosticCode::SwitchMissingDefault
                 | DiagnosticCode::SpringTransactionalPrivate
                 | DiagnosticCode::SpringPathVariableMismatch
+                | DiagnosticCode::DeprecatedUsage
+                | DiagnosticCode::MissingSerialVersionUid
         )
     }
 
@@ -112,6 +118,10 @@ impl DiagnosticCode {
                 | DiagnosticCode::UnusedParameter
                 | DiagnosticCode::UnreachableCode
         )
+    }
+
+    pub fn is_deprecated(&self) -> bool {
+        matches!(self, DiagnosticCode::DeprecatedUsage)
     }
 }
 
@@ -235,6 +245,11 @@ impl JavaAst {
         }
 
         Some(node)
+    }
+
+    /// Find AST node at specific LSP position (line, UTF-16 character)
+    pub fn find_node_at_position(&self, line: u32, character: u32) -> Option<Node<'_>> {
+        self.find_node_with_recovery(line, character)
     }
 
     /// Extract package declaration if any, e.g. "com.example.app"
@@ -442,7 +457,18 @@ impl JavaAst {
 
         fn traverse(node: tree_sitter::Node, ast: &JavaAst, used: &mut std::collections::HashSet<String>) {
             let kind = node.kind();
-            if kind == "package_declaration" || kind == "import_declaration" {
+            if kind == "import_declaration" {
+                return;
+            }
+            if kind == "package_declaration" {
+                // Traverse package declaration's modifiers/annotations (e.g. @NonNullApi in package-info.java),
+                // but skip the package name itself
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "modifiers" || child.kind() == "annotation" || child.kind() == "marker_annotation" {
+                        traverse(child, ast, used);
+                    }
+                }
                 return;
             }
 
@@ -906,6 +932,7 @@ impl JavaAst {
                                         }
                                     }
                                     
+                                    let body_text = m_child.child_by_field_name("body").map(|b| self.node_text(&b).to_string());
                                     methods.push(MethodInfo {
                                         name: m_name,
                                         return_type: ret_type,
@@ -914,7 +941,7 @@ impl JavaAst {
                                         is_public,
                                         is_constructor: is_ctor,
                                         javadoc: None,
-                                        body: None,
+                                        body: body_text,
                                     });
                                 }
                             } else if m_child.kind() == "annotation_type_element_declaration" {
@@ -1579,6 +1606,163 @@ impl JavaAst {
                 }
             }
 
+            // Helper to collect variable names assigned in any subtree
+            fn collect_assigned_names(n: tree_sitter::Node, ast: &JavaAst, assigned: &mut Vec<String>) {
+                if n.kind() == "assignment_expression" {
+                    if let Some(left) = n.child_by_field_name("left") {
+                        if left.kind() == "identifier" {
+                            assigned.push(ast.node_text(&left).to_string());
+                        }
+                    }
+                }
+                let mut cursor = n.walk();
+                for ch in n.children(&mut cursor) {
+                    collect_assigned_names(ch, ast, assigned);
+                }
+            }
+
+            // Helper to check for uninitialized variable reads with control-flow awareness
+            fn check_reads(
+                n: tree_sitter::Node,
+                ast: &JavaAst,
+                unassigned: &std::collections::HashMap<String, Range>,
+                out: &mut Vec<SemanticDiagnostic>,
+            ) {
+                if unassigned.is_empty() {
+                    return;
+                }
+
+                match n.kind() {
+                    "assignment_expression" => {
+                        // Right-hand side is evaluated first
+                        if let Some(right) = n.child_by_field_name("right") {
+                            check_reads(right, ast, unassigned, out);
+                        }
+                        // Left-hand side is only checked if it's not a simple variable identifier being assigned
+                        if let Some(left) = n.child_by_field_name("left") {
+                            if left.kind() != "identifier" {
+                                check_reads(left, ast, unassigned, out);
+                            }
+                        }
+                    }
+                    "while_statement" => {
+                        let mut curr_unassigned = unassigned.clone();
+                        if let Some(cond) = n.child_by_field_name("condition") {
+                            check_reads(cond, ast, &curr_unassigned, out);
+                            let mut cond_assigned = Vec::new();
+                            collect_assigned_names(cond, ast, &mut cond_assigned);
+                            for aname in &cond_assigned {
+                                curr_unassigned.remove(aname);
+                            }
+                        }
+                        if let Some(body) = n.child_by_field_name("body") {
+                            check_reads(body, ast, &curr_unassigned, out);
+                        }
+                    }
+                    "for_statement" => {
+                        let mut curr_unassigned = unassigned.clone();
+                        if let Some(init) = n.child_by_field_name("init") {
+                            check_reads(init, ast, &curr_unassigned, out);
+                            let mut init_assigned = Vec::new();
+                            collect_assigned_names(init, ast, &mut init_assigned);
+                            for aname in &init_assigned {
+                                curr_unassigned.remove(aname);
+                            }
+                        }
+                        if let Some(cond) = n.child_by_field_name("condition") {
+                            check_reads(cond, ast, &curr_unassigned, out);
+                            let mut cond_assigned = Vec::new();
+                            collect_assigned_names(cond, ast, &mut cond_assigned);
+                            for aname in &cond_assigned {
+                                curr_unassigned.remove(aname);
+                            }
+                        }
+                        if let Some(body) = n.child_by_field_name("body") {
+                            check_reads(body, ast, &curr_unassigned, out);
+                        }
+                        if let Some(update) = n.child_by_field_name("update") {
+                            check_reads(update, ast, &curr_unassigned, out);
+                        }
+                    }
+                    "do_statement" => {
+                        let mut body_assigned = Vec::new();
+                        if let Some(body) = n.child_by_field_name("body") {
+                            check_reads(body, ast, unassigned, out);
+                            collect_assigned_names(body, ast, &mut body_assigned);
+                        }
+                        let mut cond_unassigned = unassigned.clone();
+                        for aname in &body_assigned {
+                            cond_unassigned.remove(aname);
+                        }
+                        if let Some(cond) = n.child_by_field_name("condition") {
+                            check_reads(cond, ast, &cond_unassigned, out);
+                        }
+                    }
+                    "if_statement" => {
+                        let mut cond_assigned = Vec::new();
+                        if let Some(cond) = n.child_by_field_name("condition") {
+                            check_reads(cond, ast, unassigned, out);
+                            collect_assigned_names(cond, ast, &mut cond_assigned);
+                        }
+                        let mut branch_unassigned = unassigned.clone();
+                        for aname in &cond_assigned {
+                            branch_unassigned.remove(aname);
+                        }
+                        if let Some(cons) = n.child_by_field_name("consequence") {
+                            check_reads(cons, ast, &branch_unassigned, out);
+                        }
+                        if let Some(alt) = n.child_by_field_name("alternative") {
+                            check_reads(alt, ast, &branch_unassigned, out);
+                        }
+                    }
+                    "block" => {
+                        let mut curr_unassigned = unassigned.clone();
+                        let mut cursor = n.walk();
+                        for child in n.children(&mut cursor) {
+                            if child.kind() == "local_variable_declaration" {
+                                let mut v_cursor = child.walk();
+                                for v_child in child.children(&mut v_cursor) {
+                                    if v_child.kind() == "variable_declarator" {
+                                        if let Some(val_node) = v_child.child_by_field_name("value") {
+                                            check_reads(val_node, ast, &curr_unassigned, out);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            check_reads(child, ast, &curr_unassigned, out);
+                            let mut st_assigned = Vec::new();
+                            collect_assigned_names(child, ast, &mut st_assigned);
+                            for aname in &st_assigned {
+                                curr_unassigned.remove(aname);
+                            }
+                        }
+                    }
+                    "identifier" => {
+                        let id = ast.node_text(&n);
+                        if unassigned.contains_key(id) {
+                            let p = n.parent().map(|p| p.kind()).unwrap_or("");
+                            let is_assign_lhs = n.parent().map(|p| {
+                                p.kind() == "assignment_expression" && p.child_by_field_name("left").map(|l| l.id() == n.id()).unwrap_or(false)
+                            }).unwrap_or(false);
+                            if p != "variable_declarator" && !is_assign_lhs {
+                                out.push(SemanticDiagnostic {
+                                    range: ast.node_range(&n),
+                                    message: format!("variable '{}' might not have been initialized", id),
+                                    code: DiagnosticCode::UninitializedVariable,
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        let mut cursor = n.walk();
+                        for ch in n.children(&mut cursor) {
+                            check_reads(ch, ast, unassigned, out);
+                        }
+                    }
+                }
+            }
+
             // Check duplicate variable declaration and uninitialized local variable reads in same block
             if node.kind() == "block" {
                 let mut block_vars = std::collections::HashSet::new();
@@ -1598,53 +1782,24 @@ impl JavaAst {
                                             message: format!("Variable '{}' is already defined in scope", name),
                                             code: DiagnosticCode::DuplicateVariable,
                                         });
-                                    } else if v_child.child_by_field_name("value").is_none() {
+                                    } else if let Some(val_node) = v_child.child_by_field_name("value") {
+                                        // Check if initial value reads any unassigned variable
+                                        check_reads(val_node, ast, &unassigned_vars, out);
+                                    } else {
                                         // Variable declared without initializer: e.g. int x;
                                         unassigned_vars.insert(name, ast.node_range(&name_node));
                                     }
                                 }
                             }
                         }
-                    } else if child.kind() == "expression_statement" {
-                        // Check if it's an assignment to one of unassigned_vars
-                        let mut assigned_name = None;
-                        if let Some(expr) = child.children(&mut child.walk()).find(|c| c.kind() == "assignment_expression") {
-                            if let Some(left) = expr.child_by_field_name("left") {
-                                if left.kind() == "identifier" {
-                                    assigned_name = Some(ast.node_text(&left).to_string());
-                                }
-                            }
-                        }
-                        if let Some(aname) = assigned_name {
-                            unassigned_vars.remove(&aname);
-                        } else {
-                            // Check if reading any unassigned variable
-                            fn check_reads(
-                                n: tree_sitter::Node,
-                                ast: &JavaAst,
-                                unassigned: &std::collections::HashMap<String, Range>,
-                                out: &mut Vec<SemanticDiagnostic>,
-                            ) {
-                                if n.kind() == "identifier" {
-                                    let id = ast.node_text(&n);
-                                    if unassigned.contains_key(id) {
-                                        let p = n.parent().map(|p| p.kind()).unwrap_or("");
-                                        // Ignore declaration names or assignment left hand side
-                                        if p != "variable_declarator" {
-                                            out.push(SemanticDiagnostic {
-                                                range: ast.node_range(&n),
-                                                message: format!("variable '{}' might not have been initialized", id),
-                                                code: DiagnosticCode::UninitializedVariable,
-                                            });
-                                        }
-                                    }
-                                }
-                                let mut cursor = n.walk();
-                                for ch in n.children(&mut cursor) {
-                                    check_reads(ch, ast, unassigned, out);
-                                }
-                            }
-                            check_reads(child, ast, &unassigned_vars, out);
+                    } else {
+                        // Check reads with control-flow aware tracking (while, for, if, try, do)
+                        check_reads(child, ast, &unassigned_vars, out);
+
+                        let mut st_assigned = Vec::new();
+                        collect_assigned_names(child, ast, &mut st_assigned);
+                        for aname in &st_assigned {
+                            unassigned_vars.remove(aname);
                         }
                     }
                 }
@@ -1868,6 +2023,57 @@ impl JavaAst {
                                             .map(|b| definitely_returns(b, ast))
                                             .unwrap_or(false)
                                     }
+                                    "while_statement" => {
+                                        let cond = stmt.child_by_field_name("condition").map(|c| ast.node_text(&c)).unwrap_or_default();
+                                        let cond_clean = cond.trim_matches(|c| c == '(' || c == ')' || c == ' ');
+                                        if cond_clean == "true" {
+                                            fn has_unlabelled_break(n: tree_sitter::Node) -> bool {
+                                                if n.kind() == "break_statement" {
+                                                    return true;
+                                                }
+                                                if matches!(n.kind(), "while_statement" | "for_statement" | "do_statement" | "switch_statement") {
+                                                    return false;
+                                                }
+                                                let mut cursor = n.walk();
+                                                for child in n.children(&mut cursor) {
+                                                    if has_unlabelled_break(child) {
+                                                        return true;
+                                                    }
+                                                }
+                                                false
+                                            }
+                                            stmt.child_by_field_name("body")
+                                                .map(|b| !has_unlabelled_break(b))
+                                                .unwrap_or(false)
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    "for_statement" => {
+                                        let has_cond = stmt.child_by_field_name("condition").is_some();
+                                        if !has_cond {
+                                            fn has_unlabelled_break(n: tree_sitter::Node) -> bool {
+                                                if n.kind() == "break_statement" {
+                                                    return true;
+                                                }
+                                                if matches!(n.kind(), "while_statement" | "for_statement" | "do_statement" | "switch_statement") {
+                                                    return false;
+                                                }
+                                                let mut cursor = n.walk();
+                                                for child in n.children(&mut cursor) {
+                                                    if has_unlabelled_break(child) {
+                                                        return true;
+                                                    }
+                                                }
+                                                false
+                                            }
+                                            stmt.child_by_field_name("body")
+                                                .map(|b| !has_unlabelled_break(b))
+                                                .unwrap_or(false)
+                                        } else {
+                                            false
+                                        }
+                                    }
                                     _ => false,
                                 }
                             }
@@ -1942,6 +2148,9 @@ impl JavaAst {
                     }
 
                     for (var_name, range) in declared_vars {
+                        if var_name == "_" || var_name.starts_with("ignored") || var_name.starts_with("unused") {
+                            continue;
+                        }
                         let count = ident_counts.get(var_name.as_str()).copied().unwrap_or(0);
                         if count <= 1 {
                             out.push(SemanticDiagnostic {
@@ -1965,6 +2174,9 @@ impl JavaAst {
                             if param.kind() == "formal_parameter" {
                                 if let Some(p_name_node) = param.child_by_field_name("name") {
                                     let p_name = ast.node_text(&p_name_node);
+                                    if p_name == "_" || p_name.starts_with("ignored") || p_name.starts_with("unused") {
+                                        continue;
+                                    }
                                     let count = all_identifiers.iter().filter(|id| id.as_str() == p_name).count();
                                     if count == 0 {
                                         out.push(SemanticDiagnostic {
@@ -2007,8 +2219,9 @@ impl JavaAst {
                             if let Some(close_brace) = curr_str[open_brace + 1..].find('}') {
                                 let var_name = &curr_str[open_brace + 1..open_brace + 1 + close_brace];
                                 let clean_var = var_name.trim();
-                                if !clean_var.is_empty() {
-                                    uri_vars.push(clean_var.to_string());
+                                let clean_name = clean_var.split(':').next().unwrap_or(clean_var).trim();
+                                if !clean_name.is_empty() {
+                                    uri_vars.push(clean_name.to_string());
                                 }
                                 curr_str = &curr_str[open_brace + 1 + close_brace + 1..];
                             } else {
@@ -2016,6 +2229,33 @@ impl JavaAst {
                             }
                         }
                     }
+                }
+                // Also check enclosing class/record @RequestMapping for path variables
+                let mut p_enc = node.parent();
+                while let Some(parent_node) = p_enc {
+                    if parent_node.kind() == "class_declaration" || parent_node.kind() == "record_declaration" {
+                        for c in parent_node.children(&mut parent_node.walk()) {
+                            let text = ast.node_text(&c);
+                            if (c.kind() == "annotation" || c.kind() == "modifiers") && text.contains("Mapping") {
+                                let mut curr_str = text;
+                                while let Some(open_brace) = curr_str.find('{') {
+                                    if let Some(close_brace) = curr_str[open_brace + 1..].find('}') {
+                                        let var_name = &curr_str[open_brace + 1..open_brace + 1 + close_brace];
+                                        let clean_var = var_name.trim();
+                                        let clean_name = clean_var.split(':').next().unwrap_or(clean_var).trim();
+                                        if !clean_name.is_empty() {
+                                            uri_vars.push(clean_name.to_string());
+                                        }
+                                        curr_str = &curr_str[open_brace + 1 + close_brace + 1..];
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    p_enc = parent_node.parent();
                 }
 
                 if !uri_vars.is_empty() {
@@ -2074,6 +2314,26 @@ impl JavaAst {
                                 }
                             }
                             if parent_node.kind() == "method_declaration" || parent_node.kind() == "constructor_declaration" {
+                                let p_text = ast.node_text(&parent_node);
+                                if p_text.contains("SneakyThrows") {
+                                    in_try = true;
+                                    break;
+                                }
+                                let mut enc = parent_node.parent();
+                                while let Some(e) = enc {
+                                    if e.kind() == "class_declaration" || e.kind() == "record_declaration" {
+                                        if let Some(mods) = e.child_by_field_name("modifiers") {
+                                            if ast.node_text(&mods).contains("SneakyThrows") {
+                                                in_try = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    enc = e.parent();
+                                }
+                                if in_try {
+                                    break;
+                                }
                                 let throws_node = parent_node.child_by_field_name("throws")
                                     .or_else(|| parent_node.children(&mut parent_node.walk()).find(|c| c.kind() == "throws"));
                                 if let Some(throws_node) = throws_node {
@@ -2101,58 +2361,126 @@ impl JavaAst {
                 }
             }
 
-            // Check for private field/method direct access from other class declarations
-            if node.kind() == "field_access" {
-                if let Some(field_n) = node.child_by_field_name("field") {
-                    let field_name = ast.node_text(&field_n);
-                    if field_name.starts_with('_') || field_name.contains("private") {
-                        out.push(SemanticDiagnostic {
-                            range: ast.node_range(&field_n),
-                            message: format!("The field '{}' is not visible", field_name),
-                            code: DiagnosticCode::InaccessibleMember,
-                        });
-                    }
-                }
-            }
-
             // Check for dead code after return/throw/break statements
             if node.kind() == "block" {
                 let mut cursor = node.walk();
                 let mut has_terminated = false;
                 for child in node.children(&mut cursor) {
-                    if has_terminated && child.kind() != "}" {
-                        out.push(SemanticDiagnostic {
-                            range: ast.node_range(&child),
-                            message: "Unreachable code: statement will never be executed".to_string(),
-                            code: DiagnosticCode::UnreachableCode,
-                        });
-                        break;
+                    let k = child.kind();
+                    if has_terminated {
+                        if child.is_named() && !k.ends_with("_comment") && k != "line_comment" && k != "block_comment" && k != ";" && k != "}" && k != "{" {
+                            out.push(SemanticDiagnostic {
+                                range: ast.node_range(&child),
+                                message: "Unreachable code: statement will never be executed".to_string(),
+                                code: DiagnosticCode::UnreachableCode,
+                            });
+                            break;
+                        }
                     }
-                    if child.kind() == "return_statement"
-                        || child.kind() == "throw_statement"
-                        || child.kind() == "break_statement"
-                        || child.kind() == "continue_statement"
+                    if k == "return_statement"
+                        || k == "throw_statement"
+                        || k == "break_statement"
+                        || k == "continue_statement"
                     {
                         has_terminated = true;
                     }
                 }
             }
 
-            // Check for explicit null dereference: e.g. null.foo()
+            // Check for explicit null dereference: e.g. null.foo() or x.foo() when x is known to be null
             if node.kind() == "method_invocation" {
                 if let Some(obj) = node.child_by_field_name("object") {
-                    if ast.node_text(&obj) == "null" {
+                    let obj_name = ast.node_text(&obj);
+                    if obj_name == "null" {
                         out.push(SemanticDiagnostic {
                             range: ast.node_range(&node),
                             message: "Null pointer dereference: invoking method on null literal".to_string(),
                             code: DiagnosticCode::NullDereference,
                         });
+                    } else if obj.kind() == "identifier" {
+                        let mut curr_p = node.parent();
+                        while let Some(p) = curr_p {
+                            if p.kind() == "if_statement" {
+                                if let Some(cond) = p.child_by_field_name("condition") {
+                                    let cond_text = ast.node_text(&cond);
+                                    // Condition must not contain '||' disjunction (which makes null state non-deterministic)
+                                    // And method invocation must be strictly within the consequence body (not in the if condition)
+                                    if !cond_text.contains("||")
+                                        && (cond_text.contains(&format!("{} == null", obj_name))
+                                            || cond_text.contains(&format!("null == {}", obj_name)))
+                                        && let Some(conseq) = p.child_by_field_name("consequence") {
+                                            if node.start_byte() >= conseq.start_byte()
+                                                && node.end_byte() <= conseq.end_byte() {
+                                                // If variable was assigned a non-null value before this invocation, it is not null
+                                                fn is_var_assigned_before(scope: tree_sitter::Node, var: &str, before: usize, ast: &JavaAst) -> bool {
+                                                    let mut stack = vec![scope];
+                                                    while let Some(n) = stack.pop() {
+                                                        if n.start_byte() >= before {
+                                                            continue;
+                                                        }
+                                                        if n.kind() == "assignment_expression" {
+                                                            if let Some(left) = n.child_by_field_name("left") {
+                                                                let left_text = ast.node_text(&left);
+                                                                let clean = left_text.trim();
+                                                                if clean == var || clean.ends_with(&format!(".{}", var)) {
+                                                                    if let Some(right) = n.child_by_field_name("right") {
+                                                                        if ast.node_text(&right).trim() != "null" {
+                                                                            return true;
+                                                                        }
+                                                                    } else {
+                                                                        return true;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        let mut cursor = n.walk();
+                                                        for child in n.children(&mut cursor) {
+                                                            if child.start_byte() < before {
+                                                                stack.push(child);
+                                                            }
+                                                        }
+                                                    }
+                                                    false
+                                                }
+
+                                                if is_var_assigned_before(conseq, &obj_name, node.start_byte(), ast) {
+                                                    break;
+                                                }
+
+                                                out.push(SemanticDiagnostic {
+                                                    range: ast.node_range(&node),
+                                                    message: format!("Potential null pointer access: '{}' is known to be null at this location", obj_name),
+                                                    code: DiagnosticCode::NullDereference,
+                                                });
+                                                break;
+                                            }
+                                        }
+                                }
+                            }
+                            if p.kind() == "method_declaration" {
+                                break;
+                            }
+                            curr_p = p.parent();
+                        }
                     }
                 }
 
                 // Check for method invocations throwing well-known Checked Exceptions outside try-catch
                 let m_name = node.child_by_field_name("name").map(|n| ast.node_text(&n)).unwrap_or("");
                 let obj_text = node.child_by_field_name("object").map(|o| ast.node_text(&o)).unwrap_or("");
+
+                // Check for deprecated method invocations
+                let is_known_deprecated = (obj_text.contains("Thread") && (m_name == "stop" || m_name == "suspend" || m_name == "resume"))
+                    || (obj_text.contains("Date") && (m_name == "getYear" || m_name == "setYear" || m_name == "getMonth" || m_name == "getHours"))
+                    || (obj_text == "System" && m_name == "runFinalizersOnExit");
+                if is_known_deprecated {
+                    out.push(SemanticDiagnostic {
+                        range: ast.node_range(&node),
+                        message: format!("The method '{}' from the type '{}' is deprecated", m_name, obj_text),
+                        code: DiagnosticCode::DeprecatedUsage,
+                    });
+                }
+
                 let checked_exc = if (obj_text == "Thread" && m_name == "sleep") || m_name == "wait" {
                     Some("InterruptedException")
                 } else if (obj_text == "Files" && (m_name.starts_with("read") || m_name.starts_with("write") || m_name == "copy" || m_name == "lines"))
@@ -2177,6 +2505,26 @@ impl JavaAst {
                             }
                         }
                         if parent_node.kind() == "method_declaration" || parent_node.kind() == "constructor_declaration" {
+                            let p_text = ast.node_text(&parent_node);
+                            if p_text.contains("SneakyThrows") {
+                                in_try = true;
+                                break;
+                            }
+                            let mut enc = parent_node.parent();
+                            while let Some(e) = enc {
+                                if e.kind() == "class_declaration" || e.kind() == "record_declaration" {
+                                    if let Some(mods) = e.child_by_field_name("modifiers") {
+                                        if ast.node_text(&mods).contains("SneakyThrows") {
+                                            in_try = true;
+                                        }
+                                    }
+                                    break;
+                                }
+                                enc = e.parent();
+                            }
+                            if in_try {
+                                break;
+                            }
                             let throws_node = parent_node.child_by_field_name("throws")
                                 .or_else(|| parent_node.children(&mut parent_node.walk()).find(|c| c.kind() == "throws"));
                             if let Some(throws_node) = throws_node {
@@ -2209,19 +2557,32 @@ impl JavaAst {
                     let obj_text = ast.node_text(&obj);
                     let static_owner = match m_name {
                         "sleep" | "yield" | "currentThread" | "interrupted" | "holdsLock" => Some("Thread"),
-                        "currentTimeMillis" | "nanoTime" | "gc" | "exit" | "getenv" | "getProperty" | "lineSeparator" => Some("System"),
+                        "currentTimeMillis" | "nanoTime" | "gc" | "exit" | "getenv" | "lineSeparator" => Some("System"),
                         "emptyList" | "emptyMap" | "emptySet" | "singletonList" | "unmodifiableList" => Some("Collections"),
-                        "min" | "max" | "abs" | "sqrt" | "pow" | "random" | "round" | "ceil" | "floor" => Some("Math"),
                         "requireNonNull" | "checkIndex" => Some("Objects"),
                         _ => None,
                     };
                     if let Some(owner) = static_owner {
                         if obj_text != owner && !obj_text.ends_with(&format!(".{}", owner)) && obj_text != "super" && obj_text != "this" {
-                            out.push(SemanticDiagnostic {
-                                range: ast.node_range(&node),
-                                message: format!("The static method '{}' from the type '{}' should be accessed in a static way", m_name, owner),
-                                code: DiagnosticCode::StaticMemberViaInstance,
-                            });
+                            let start = node.start_position();
+                            let locals = ast.extract_local_variables_at_position(start.row as u32, start.column as u32);
+                            let is_matching_type = if obj.kind() == "identifier" {
+                                if let Some((_, var_type)) = locals.iter().find(|(name, _)| name == &obj_text) {
+                                    var_type == owner || var_type.ends_with(&format!(".{}", owner))
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if is_matching_type {
+                                out.push(SemanticDiagnostic {
+                                    range: ast.node_range(&node),
+                                    message: format!("The static method '{}' from the type '{}' should be accessed in a static way", m_name, owner),
+                                    code: DiagnosticCode::StaticMemberViaInstance,
+                                });
+                            }
                         }
                     }
                 }
@@ -2237,11 +2598,44 @@ impl JavaAst {
                     if n.kind() == "assignment_expression" {
                         let text = ast.node_text(&n);
                         if text.contains("+=") {
-                            out.push(SemanticDiagnostic {
-                                range: ast.node_range(&n),
-                                message: "String concatenation in loop: consider using 'StringBuilder' for better performance".to_string(),
-                                code: DiagnosticCode::StringConcatInLoop,
-                            });
+                            // Only warn if the variable is declared as String or the RHS contains a string literal or string method call,
+                            // avoiding false positives on numeric accumulators (e.g. sum += i)
+                            let is_string_rhs = if let Some(right) = n.child_by_field_name("right") {
+                                let rtext = ast.node_text(&right);
+                                right.kind() == "string_literal" || rtext.contains('"') || rtext.contains(".toString()") || rtext.contains("String.valueOf(")
+                            } else {
+                                false
+                            };
+                            let is_string_target = if let Some(left) = n.child_by_field_name("left") {
+                                let var_name = ast.node_text(&left);
+                                let mut p = n.parent();
+                                let mut found_str = false;
+                                while let Some(parent_node) = p {
+                                    if matches!(parent_node.kind(), "method_declaration" | "constructor_declaration" | "class_declaration") {
+                                        let p_text = ast.node_text(&parent_node);
+                                        for line in p_text.lines() {
+                                            let trimmed = line.trim();
+                                            if (trimmed.starts_with("String ") || trimmed.starts_with("String\t") || trimmed.contains(" String "))
+                                                && trimmed.contains(var_name) {
+                                                found_str = true;
+                                                break;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    p = parent_node.parent();
+                                }
+                                found_str
+                            } else {
+                                false
+                            };
+                            if is_string_rhs || is_string_target {
+                                out.push(SemanticDiagnostic {
+                                    range: ast.node_range(&n),
+                                    message: "String concatenation in loop: consider using 'StringBuilder' for better performance".to_string(),
+                                    code: DiagnosticCode::StringConcatInLoop,
+                                });
+                            }
                         }
                     }
                     let mut cursor = n.walk();
@@ -2256,8 +2650,36 @@ impl JavaAst {
 
             // Check for uninitialized blank final fields in class constructors
             if node.kind() == "class_declaration" {
+                let class_mods_text = {
+                    let mut text = String::new();
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.kind() == "modifiers" || child.kind() == "annotation" || child.kind() == "marker_annotation" {
+                            text.push_str(ast.node_text(&child));
+                            text.push(' ');
+                        } else if matches!(child.kind(), "class" | "interface" | "enum" | "record") {
+                            break;
+                        }
+                    }
+                    text
+                };
+                let has_lombok_ctors = class_mods_text.contains("RequiredArgsConstructor")
+                    || class_mods_text.contains("AllArgsConstructor")
+                    || class_mods_text.contains("Data")
+                    || class_mods_text.contains("Value")
+                    || class_mods_text.contains("Builder");
+                let has_lombok_data_or_getters = has_lombok_ctors
+                    || class_mods_text.contains("Getter")
+                    || class_mods_text.contains("Setter")
+                    || class_mods_text.contains("ToString")
+                    || class_mods_text.contains("EqualsAndHashCode")
+                    || class_mods_text.contains("Entity")
+                    || class_mods_text.contains("Table")
+                    || class_mods_text.contains("ConfigurationProperties");
+
                 let mut blank_final_fields = Vec::new();
                 let mut constructors = Vec::new();
+                let mut has_instance_init = false;
 
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut cursor = body.walk();
@@ -2283,11 +2705,13 @@ impl JavaAst {
                             }
                         } else if member.kind() == "constructor_declaration" {
                             constructors.push(member);
+                        } else if member.kind() == "block" {
+                            has_instance_init = true;
                         }
                     }
                 }
 
-                if !blank_final_fields.is_empty() && !constructors.is_empty() {
+                if !has_lombok_ctors && !has_instance_init && !blank_final_fields.is_empty() && !constructors.is_empty() {
                     for ctor in &constructors {
                         let ctor_text = ast.node_text(ctor);
                         if ctor_text.contains("this(") {
@@ -2327,6 +2751,12 @@ impl JavaAst {
                         }
                     }
 
+                    let iface_has = |target: &str| -> bool {
+                        iface_names.iter().any(|iface| {
+                            iface.split(|c: char| !c.is_alphanumeric()).any(|part| part == target)
+                        })
+                    };
+
                     let mut cursor = body.walk();
                     for member in body.children(&mut cursor) {
                         if member.kind() == "field_declaration" {
@@ -2335,11 +2765,14 @@ impl JavaAst {
                                     || ast.node_text(&c) == "private"
                             });
                             let is_annotated = member.children(&mut member.walk()).any(|c| c.kind() == "marker_annotation" || c.kind() == "annotation");
-                            if is_private && !is_annotated {
+                            if is_private && !is_annotated && !has_lombok_data_or_getters {
                                 for dec in member.children(&mut member.walk()) {
                                     if dec.kind() == "variable_declarator" {
                                         if let Some(name_node) = dec.child_by_field_name("name") {
-                                            private_fields.push((ast.node_text(&name_node).to_string(), ast.node_range(&name_node)));
+                                            let fname = ast.node_text(&name_node);
+                                            if fname != "serialVersionUID" && !fname.starts_with('_') {
+                                                private_fields.push((fname.to_string(), ast.node_range(&name_node)));
+                                            }
                                         }
                                     }
                                 }
@@ -2352,7 +2785,10 @@ impl JavaAst {
                             let is_annotated = member.children(&mut member.walk()).any(|c| c.kind() == "marker_annotation" || c.kind() == "annotation");
                             if is_private && !is_annotated {
                                 if let Some(name_node) = member.child_by_field_name("name") {
-                                    private_methods.push((ast.node_text(&name_node).to_string(), ast.node_range(&name_node)));
+                                    let m_name = ast.node_text(&name_node);
+                                    if !matches!(m_name, "readObject" | "writeObject" | "readObjectNoData" | "writeReplace" | "readResolve") {
+                                        private_methods.push((m_name.to_string(), ast.node_range(&name_node)));
+                                    }
                                 }
                             }
 
@@ -2415,19 +2851,18 @@ impl JavaAst {
 
                     // Check if methods match standard interfaces
                     if !iface_names.is_empty() && !methods_to_check_override.is_empty() {
-                        let joined_ifaces = iface_names.join(" ");
                         for (mname, pcount, mrange) in methods_to_check_override {
-                            let matched_iface = if joined_ifaces.contains("Runnable") && mname == "run" && pcount == 0 {
+                            let matched_iface = if iface_has("Runnable") && mname == "run" && pcount == 0 {
                                 Some("Runnable")
-                            } else if joined_ifaces.contains("Comparable") && mname == "compareTo" && pcount == 1 {
+                            } else if iface_has("Comparable") && mname == "compareTo" && pcount == 1 {
                                 Some("Comparable")
-                            } else if (joined_ifaces.contains("Closeable") || joined_ifaces.contains("AutoCloseable")) && mname == "close" && pcount == 0 {
+                            } else if (iface_has("Closeable") || iface_has("AutoCloseable")) && mname == "close" && pcount == 0 {
                                 Some("AutoCloseable")
-                            } else if joined_ifaces.contains("Callable") && mname == "call" && pcount == 0 {
+                            } else if iface_has("Callable") && mname == "call" && pcount == 0 {
                                 Some("Callable")
-                            } else if joined_ifaces.contains("Supplier") && mname == "get" && pcount == 0 {
+                            } else if iface_has("Supplier") && mname == "get" && pcount == 0 {
                                 Some("Supplier")
-                            } else if joined_ifaces.contains("Consumer") && mname == "accept" && pcount == 1 {
+                            } else if iface_has("Consumer") && mname == "accept" && pcount == 1 {
                                 Some("Consumer")
                             } else {
                                 None
@@ -2438,6 +2873,69 @@ impl JavaAst {
                                     range: mrange,
                                     message: format!("Method '{}' overrides or implements a method in '{}', but is missing '@Override' annotation", mname, iface),
                                     code: DiagnosticCode::MissingOverride,
+                                });
+                            }
+                        }
+                    }
+
+                    // Check for unimplemented abstract methods if the class is concrete and has no superclass
+                    let is_abstract_class = node.child_by_field_name("modifiers")
+                        .map(|m| ast.node_text(&m).contains("abstract"))
+                        .unwrap_or(false);
+                    let has_superclass = node.child_by_field_name("superclass").is_some();
+                    if !is_abstract_class && !has_superclass && !iface_names.is_empty() {
+                        let all_methods: Vec<String> = if let Some(body) = node.child_by_field_name("body") {
+                            let mut cursor = body.walk();
+                            body.children(&mut cursor)
+                                .filter(|c| c.kind() == "method_declaration")
+                                .filter_map(|c| c.child_by_field_name("name").map(|n| ast.node_text(&n).to_string()))
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                        let expected_methods: Vec<(&str, &str)> = [
+                            ("Runnable", "run"),
+                            ("Callable", "call"),
+                            ("AutoCloseable", "close"),
+                            ("Closeable", "close"),
+                            ("Comparable", "compareTo"),
+                            ("Supplier", "get"),
+                            ("Consumer", "accept"),
+                        ].iter().filter(|(iface, _)| iface_has(iface)).copied().collect();
+
+                        for (iface, required_method) in expected_methods {
+                            if !all_methods.iter().any(|m| m == required_method) {
+                                let class_name = node.child_by_field_name("name").map(|n| ast.node_text(&n)).unwrap_or("Class");
+                                let class_range = node.child_by_field_name("name").map(|n| ast.node_range(&n)).unwrap_or_else(|| ast.node_range(&node));
+                                out.push(SemanticDiagnostic {
+                                    range: class_range,
+                                    message: format!("The type '{}' must implement the inherited abstract method '{}()' from '{}'", class_name, required_method, iface),
+                                    code: DiagnosticCode::UnimplementedAbstractMethod,
+                                });
+                            }
+                        }
+
+                        if iface_has("Serializable") {
+                            let mut has_serial_version_uid = false;
+                            if let Some(body) = node.child_by_field_name("body") {
+                                let mut b_cursor = body.walk();
+                                for b_child in body.children(&mut b_cursor) {
+                                    if b_child.kind() == "field_declaration" {
+                                        let text = ast.node_text(&b_child);
+                                        if text.contains("serialVersionUID") {
+                                            has_serial_version_uid = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if !has_serial_version_uid {
+                                let class_name = node.child_by_field_name("name").map(|n| ast.node_text(&n)).unwrap_or("Class");
+                                let class_range = node.child_by_field_name("name").map(|n| ast.node_range(&n)).unwrap_or_else(|| ast.node_range(&node));
+                                out.push(SemanticDiagnostic {
+                                    range: class_range,
+                                    message: format!("The serializable class '{}' does not declare a static final serialVersionUID field of type long", class_name),
+                                    code: DiagnosticCode::MissingSerialVersionUid,
                                 });
                             }
                         }
@@ -3080,6 +3578,441 @@ impl JavaAst {
         Some(("Surround with try-catch".to_string(), range, wrapped))
     }
 
+    /// Generate "Surround with if" refactoring
+    pub fn generate_surround_with_if(
+        &self,
+        start_line: u32,
+        _start_col: u32,
+        end_line: u32,
+        _end_col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let (s_line, e_line) = (start_line.min(end_line), start_line.max(end_line));
+        let lines: Vec<&str> = self.source.lines().collect();
+        if s_line as usize >= lines.len() {
+            return None;
+        }
+
+        let first_line = lines[s_line as usize];
+        let base_indent: String = first_line.chars().take_while(|c| c.is_whitespace()).collect();
+        let body_indent = format!("{}    ", base_indent);
+
+        let mut wrapped = String::new();
+        wrapped.push_str(&format!("{}if (condition) {{\n", base_indent));
+        for i in s_line..=e_line.min(lines.len().saturating_sub(1) as u32) {
+            let line = lines[i as usize];
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                wrapped.push('\n');
+            } else {
+                wrapped.push_str(&body_indent);
+                wrapped.push_str(trimmed);
+                wrapped.push('\n');
+            }
+        }
+        wrapped.push_str(&format!("{}}}\n", base_indent));
+
+        let has_next_line = (e_line as usize + 1) < lines.len();
+        let range = if has_next_line {
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: s_line, character: 0 },
+                end: tower_lsp::lsp_types::Position { line: e_line + 1, character: 0 },
+            }
+        } else {
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: s_line, character: 0 },
+                end: tower_lsp::lsp_types::Position { line: e_line, character: lines[e_line as usize].len() as u32 },
+            }
+        };
+
+        Some(("Surround with 'if (condition)'".to_string(), range, wrapped))
+    }
+
+    /// Generate "Surround with while" refactoring
+    pub fn generate_surround_with_while(
+        &self,
+        start_line: u32,
+        _start_col: u32,
+        end_line: u32,
+        _end_col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let (s_line, e_line) = (start_line.min(end_line), start_line.max(end_line));
+        let lines: Vec<&str> = self.source.lines().collect();
+        if s_line as usize >= lines.len() {
+            return None;
+        }
+
+        let first_line = lines[s_line as usize];
+        let base_indent: String = first_line.chars().take_while(|c| c.is_whitespace()).collect();
+        let body_indent = format!("{}    ", base_indent);
+
+        let mut wrapped = String::new();
+        wrapped.push_str(&format!("{}while (condition) {{\n", base_indent));
+        for i in s_line..=e_line.min(lines.len().saturating_sub(1) as u32) {
+            let line = lines[i as usize];
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                wrapped.push('\n');
+            } else {
+                wrapped.push_str(&body_indent);
+                wrapped.push_str(trimmed);
+                wrapped.push('\n');
+            }
+        }
+        wrapped.push_str(&format!("{}}}\n", base_indent));
+
+        let has_next_line = (e_line as usize + 1) < lines.len();
+        let range = if has_next_line {
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: s_line, character: 0 },
+                end: tower_lsp::lsp_types::Position { line: e_line + 1, character: 0 },
+            }
+        } else {
+            tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: s_line, character: 0 },
+                end: tower_lsp::lsp_types::Position { line: e_line, character: lines[e_line as usize].len() as u32 },
+            }
+        };
+
+        Some(("Surround with 'while (condition)'".to_string(), range, wrapped))
+    }
+
+    /// Generate "Generate Delegate Methods" refactoring for a field
+    pub fn generate_delegate_methods(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut field_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "field_declaration" {
+                field_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let field = field_node?;
+        let type_node = field.child_by_field_name("type")?;
+        let type_name = self.node_text(&type_node);
+
+        let mut declarator = None;
+        let mut cursor = field.walk();
+        for child in field.children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                declarator = Some(child);
+                break;
+            }
+        }
+        let decl = declarator?;
+        let name_node = decl.child_by_field_name("name")?;
+        let field_name = self.node_text(&name_node);
+
+        let delegate_code = format!(
+            "\n    public void executeOn{}() {{\n        this.{}.run();\n    }}\n",
+            field_name, field_name
+        );
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: field.end_position().row as u32 + 1,
+                character: 0,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: field.end_position().row as u32 + 1,
+                character: 0,
+            },
+        };
+
+        Some((
+            format!("Generate delegate methods for '{}' ({})", field_name, type_name),
+            range,
+            delegate_code,
+        ))
+    }
+
+    /// Generate "Generate Element Javadoc" code action
+    pub fn generate_javadoc_comment(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+        let mut curr = node;
+        let mut target_node = None;
+        while let Some(n) = curr {
+            if matches!(n.kind(), "method_declaration" | "constructor_declaration" | "class_declaration" | "interface_declaration") {
+                target_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let target = target_node?;
+        let start_pt = target.start_position();
+        let insert_line = start_pt.row as u32;
+
+        let lines: Vec<&str> = self.source.lines().collect();
+        // Check if previous non-empty line already ends with */
+        if insert_line > 0 {
+            let prev_line = lines.get((insert_line - 1) as usize).unwrap_or(&"").trim();
+            if prev_line.ends_with("*/") {
+                return None;
+            }
+        }
+
+        let base_indent = if (insert_line as usize) < lines.len() {
+            lines[insert_line as usize].chars().take_while(|c| c.is_whitespace()).collect::<String>()
+        } else {
+            String::new()
+        };
+
+        let mut doc = String::new();
+        doc.push_str(&format!("{}/**\n", base_indent));
+
+        if target.kind() == "method_declaration" || target.kind() == "constructor_declaration" {
+            let name = target.child_by_field_name("name").map(|n| self.node_text(&n)).unwrap_or("method");
+            doc.push_str(&format!("{} * {}.\n", base_indent, name));
+            doc.push_str(&format!("{} *\n", base_indent));
+
+            if let Some(params_node) = target.child_by_field_name("parameters") {
+                let mut cursor = params_node.walk();
+                for child in params_node.children(&mut cursor) {
+                    if child.kind() == "formal_parameter" {
+                        if let Some(p_name_node) = child.child_by_field_name("name") {
+                            let p_name = self.node_text(&p_name_node);
+                            doc.push_str(&format!("{} * @param {} the {}\n", base_indent, p_name, p_name));
+                        }
+                    }
+                }
+            }
+
+            if let Some(type_node) = target.child_by_field_name("type") {
+                let ret_type = self.node_text(&type_node);
+                if ret_type != "void" {
+                    doc.push_str(&format!("{} * @return {}\n", base_indent, ret_type));
+                }
+            }
+        } else {
+            let name = target.child_by_field_name("name").map(|n| self.node_text(&n)).unwrap_or("Type");
+            doc.push_str(&format!("{} * The type {}.\n", base_indent, name));
+            doc.push_str(&format!("{} *\n", base_indent));
+            doc.push_str(&format!("{} * @author developer\n", base_indent));
+        }
+
+        doc.push_str(&format!("{} */\n", base_indent));
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+            end: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+        };
+
+        Some(("Generate Element Javadoc".to_string(), range, doc))
+    }
+
+    /// Generate pattern matching instanceof refactoring (Java 16+)
+    pub fn generate_pattern_instanceof_refactoring(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        let mut inst_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "instanceof_expression" {
+                inst_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let expr = inst_node?;
+        let left = expr.child(0)?;
+        let right = expr.child(2)?;
+
+        // If it already has pattern variable (more than 3 children or right is a pattern), skip
+        if expr.child_count() > 3 {
+            return None;
+        }
+
+        let left_text = self.node_text(&left);
+        let right_text = self.node_text(&right);
+        let var_name = right_text.chars().next().map(|c| c.to_lowercase().to_string()).unwrap_or_else(|| "val".to_string());
+
+        let new_text = format!("{} instanceof {} {}", left_text, right_text, var_name);
+        let r = self.node_range(&expr);
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: r.start.line, character: r.start.character },
+            end: tower_lsp::lsp_types::Position { line: r.end.line, character: r.end.character },
+        };
+
+        Some(("Use pattern matching for 'instanceof'".to_string(), range, new_text))
+    }
+
+    /// Generate "Assign parameter to field" refactoring in constructors
+    pub fn generate_assign_param_to_field(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        let mut param_node = None;
+        let mut ctor_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "formal_parameter" && param_node.is_none() {
+                param_node = Some(n);
+            }
+            if n.kind() == "constructor_declaration" {
+                ctor_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let param = param_node?;
+        let ctor = ctor_node?;
+        let _p_type = param.child_by_field_name("type")?;
+        let p_name = param.child_by_field_name("name")?;
+        let name_str = self.node_text(&p_name);
+
+        let body = ctor.child_by_field_name("body")?;
+        let body_start = body.start_position();
+        let insert_line = body_start.row as u32 + 1;
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+            end: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+        };
+        let code = format!("        this.{} = {};\n", name_str, name_str);
+
+        Some((format!("Assign parameter '{}' to field", name_str), range, code))
+    }
+
+    /// Generate refactoring to convert switch statement with return/break to enhanced switch rules (->)
+    pub fn generate_convert_to_switch_rule(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        let mut switch_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "switch_statement" || n.kind() == "switch_expression" {
+                switch_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let sw = switch_node?;
+        let body = sw.child_by_field_name("body")?;
+        let body_text = self.node_text(&body);
+
+        if body_text.contains("->") {
+            return None;
+        }
+
+        let lines: Vec<&str> = body_text.lines().collect();
+        let mut new_lines = Vec::new();
+        let mut converted_any = false;
+
+        for l in lines {
+            let trimmed = l.trim();
+            if trimmed.starts_with("case ") && trimmed.ends_with(':') {
+                let case_val = trimmed.trim_end_matches(':');
+                new_lines.push(format!("    {} ->", case_val));
+                converted_any = true;
+            } else if trimmed == "default:" {
+                new_lines.push("    default ->".to_string());
+                converted_any = true;
+            } else if trimmed == "break;" {
+                // omit redundant break
+            } else {
+                new_lines.push(l.to_string());
+            }
+        }
+
+        if !converted_any {
+            return None;
+        }
+
+        let r = self.node_range(&body);
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: r.start.line, character: r.start.character },
+            end: tower_lsp::lsp_types::Position { line: r.end.line, character: r.end.character },
+        };
+
+        Some(("Convert to enhanced switch rule ('->')".to_string(), range, new_lines.join("\n")))
+    }
+
+    /// Generate refactoring to convert string literal to Java 15+ text block (""")
+    pub fn generate_convert_to_text_block(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        let mut str_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "string_literal" {
+                str_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let s = str_node?;
+        let raw = self.node_text(&s);
+        if !raw.contains("\\n") && !raw.contains("\\\"") {
+            return None;
+        }
+
+        let unescaped = raw
+            .trim_matches('"')
+            .replace("\\n", "\n")
+            .replace("\\\"", "\"");
+
+        let text_block = format!("\"\"\"\n{}\"\"\"", unescaped);
+        let r = self.node_range(&s);
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: r.start.line, character: r.start.character },
+            end: tower_lsp::lsp_types::Position { line: r.end.line, character: r.end.character },
+        };
+
+        Some(("Convert to text block (Java 15+)".to_string(), range, text_block))
+    }
+
     /// Generate "Add return statement" quickfix for methods with missing return
     pub fn generate_missing_return_quickfix(
         &self,
@@ -3620,6 +4553,141 @@ impl JavaAst {
         Some(("Add '@Override' annotation".to_string(), range, new_text))
     }
 
+    /// Generate "Add unimplemented methods" quickfix
+    pub fn generate_unimplemented_methods_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        let mut class_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "class_declaration" {
+                class_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let cls = class_node?;
+        let body = cls.child_by_field_name("body")?;
+        let mut iface_names = Vec::new();
+        if let Some(interfaces_node) = cls.child_by_field_name("interfaces") {
+            let mut cursor = interfaces_node.walk();
+            for child in interfaces_node.children(&mut cursor) {
+                if child.kind() == "type_identifier" || child.kind().ends_with("_type") {
+                    iface_names.push(self.node_text(&child).to_string());
+                }
+            }
+        }
+        for ch in cls.children(&mut cls.walk()) {
+            if ch.kind() == "super_interfaces" || ch.kind() == "extends_interfaces" {
+                iface_names.push(self.node_text(&ch).to_string());
+            }
+        }
+
+        let joined = iface_names.join(" ");
+        let method_stub = if joined.contains("Runnable") {
+            "\n    @Override\n    public void run() {\n        // TODO: Auto-generated method stub\n    }\n"
+        } else if joined.contains("Callable") {
+            "\n    @Override\n    public Object call() throws Exception {\n        return null;\n    }\n"
+        } else if joined.contains("AutoCloseable") || joined.contains("Closeable") {
+            "\n    @Override\n    public void close() throws Exception {\n        // TODO: Auto-generated method stub\n    }\n"
+        } else if joined.contains("Comparable") {
+            "\n    @Override\n    public int compareTo(Object o) {\n        return 0;\n    }\n"
+        } else if joined.contains("Supplier") {
+            "\n    @Override\n    public Object get() {\n        return null;\n    }\n"
+        } else if joined.contains("Consumer") {
+            "\n    @Override\n    public void accept(Object t) {\n        // TODO: Auto-generated method stub\n    }\n"
+        } else {
+            return None;
+        };
+
+        let end_pt = body.end_position();
+        let insert_line = end_pt.row.saturating_sub(1) as u32;
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+            end: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+        };
+
+        Some(("Add unimplemented methods".to_string(), range, method_stub.to_string()))
+    }
+
+    /// Generate QuickFix to add default serialVersionUID to Serializable class
+    pub fn generate_serial_version_uid_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        let mut class_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "class_declaration" {
+                class_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+        let cls = class_node?;
+        let body = cls.child_by_field_name("body")?;
+        let start_pt = body.start_position();
+        let insert_line = start_pt.row as u32 + 1;
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+            end: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+        };
+        let code = "    private static final long serialVersionUID = 1L;\n\n";
+        Some(("Add default serial version ID".to_string(), range, code.to_string()))
+    }
+
+    /// Generate QuickFix to add @SuppressWarnings("...") annotation
+    pub fn generate_suppress_warnings_quickfix(
+        &self,
+        line: u32,
+        col: u32,
+        warning_type: &str,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let mut curr = root.descendant_for_point_range(point, point);
+        let mut target_node = None;
+        while let Some(n) = curr {
+            if matches!(n.kind(), "method_declaration" | "field_declaration" | "class_declaration" | "local_variable_declaration" | "constructor_declaration") {
+                target_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+        let target = target_node?;
+        let start_pt = target.start_position();
+        let insert_line = start_pt.row as u32;
+        let lines: Vec<&str> = self.source.lines().collect();
+        let base_indent = if (insert_line as usize) < lines.len() {
+            lines[insert_line as usize].chars().take_while(|c| c.is_whitespace()).collect::<String>()
+        } else {
+            String::new()
+        };
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+            end: tower_lsp::lsp_types::Position { line: insert_line, character: 0 },
+        };
+        let code = format!("{}@SuppressWarnings(\"{}\")\n", base_indent, warning_type);
+        Some((format!("Add @SuppressWarnings(\"{}\")", warning_type), range, code))
+    }
+
     /// Generate QuickFix to change instance method/field access to static type access
     pub fn generate_static_access_quickfix(
         &self,
@@ -3648,12 +4716,33 @@ impl JavaAst {
         let m_name = self.node_text(&name_node);
         let static_owner = match m_name {
             "sleep" | "yield" | "currentThread" | "interrupted" | "holdsLock" => Some("Thread"),
-            "currentTimeMillis" | "nanoTime" | "gc" | "exit" | "getenv" | "getProperty" | "lineSeparator" => Some("System"),
+            "currentTimeMillis" | "nanoTime" | "gc" | "exit" | "getenv" | "lineSeparator" => Some("System"),
             "emptyList" | "emptyMap" | "emptySet" | "singletonList" | "unmodifiableList" => Some("Collections"),
             "min" | "max" | "abs" | "sqrt" | "pow" | "random" | "round" | "ceil" | "floor" => Some("Math"),
             "requireNonNull" | "checkIndex" => Some("Objects"),
             _ => None,
         }?;
+
+        let obj_text = self.node_text(&obj_node);
+        if obj_text == static_owner || obj_text.ends_with(&format!(".{}", static_owner)) || obj_text == "super" || obj_text == "this" {
+            return None;
+        }
+
+        let start = m_node.start_position();
+        let locals = self.extract_local_variables_at_position(start.row as u32, start.column as u32);
+        let is_matching_type = if obj_node.kind() == "identifier" {
+            if let Some((_, var_type)) = locals.iter().find(|(name, _)| name == &obj_text) {
+                var_type == static_owner || var_type.ends_with(&format!(".{}", static_owner))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !is_matching_type {
+            return None;
+        }
 
         let range = self.node_lsp_range(&obj_node);
         let title = format!("Change access to static '{}.{}'", static_owner, m_name);
@@ -3818,12 +4907,343 @@ impl JavaAst {
         Some(("Convert to try-with-resources".to_string(), range, new_code))
     }
 
+    /// Generate "Extract Interface" refactoring
+    pub fn generate_extract_interface(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut class_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "class_declaration" {
+                class_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let cls = class_node?;
+        let name_node = cls.child_by_field_name("name")?;
+        let class_name = self.node_text(&name_node);
+        let interface_name = format!("I{}", class_name);
+
+        let body = cls.child_by_field_name("body")?;
+        let mut method_sigs = Vec::new();
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            if child.kind() == "method_declaration" {
+                let _text = self.node_text(&child);
+                let is_public = child
+                    .child_by_field_name("modifiers")
+                    .map(|m| self.node_text(&m).contains("public"))
+                    .unwrap_or(true);
+                let is_static = child
+                    .child_by_field_name("modifiers")
+                    .map(|m| self.node_text(&m).contains("static"))
+                    .unwrap_or(false);
+
+                if is_public && !is_static {
+                    if let Some(body_n) = child.child_by_field_name("body") {
+                        let sig_end = body_n.start_byte();
+                        let sig_start = child.start_byte();
+                        if sig_start < sig_end {
+                            let sig = self.source[sig_start..sig_end].trim();
+                            method_sigs.push(format!("    {};", sig));
+                        }
+                    }
+                }
+            }
+        }
+
+        let interface_code = format!(
+            "\npublic interface {} {{\n{}\n}}\n",
+            interface_name,
+            method_sigs.join("\n")
+        );
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: cls.end_position().row as u32 + 1,
+                character: 0,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: cls.end_position().row as u32 + 1,
+                character: 0,
+            },
+        };
+
+        Some((
+            format!("Extract interface '{}'", interface_name),
+            range,
+            interface_code,
+        ))
+    }
+
+    /// Generate "Encapsulate Field" refactoring
+    pub fn generate_encapsulate_field(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut field_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "field_declaration" {
+                field_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let field = field_node?;
+        let modifiers_node = field.child_by_field_name("modifiers");
+        let mod_text = modifiers_node.map(|m| self.node_text(&m)).unwrap_or_default();
+        if mod_text.contains("private") {
+            return None;
+        }
+
+        let type_node = field.child_by_field_name("type")?;
+        let type_text = self.node_text(&type_node);
+
+        let mut declarator = None;
+        let mut cursor = field.walk();
+        for child in field.children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                declarator = Some(child);
+                break;
+            }
+        }
+        let decl = declarator?;
+        let name_node = decl.child_by_field_name("name")?;
+        let field_name = self.node_text(&name_node);
+
+        let capitalized = {
+            let mut chars = field_name.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => field_name.to_string(),
+            }
+        };
+
+        let is_bool = type_text == "boolean" || type_text == "Boolean";
+        let getter_name = if is_bool {
+            format!("is{}", capitalized)
+        } else {
+            format!("get{}", capitalized)
+        };
+        let setter_name = format!("set{}", capitalized);
+
+        let new_field_decl = format!("private {} {};\n\n    public {} {}() {{\n        return this.{};\n    }}\n\n    public void {}({} {}) {{\n        this.{} = {};\n    }}",
+            type_text, field_name, type_text, getter_name, field_name, setter_name, type_text, field_name, field_name, field_name);
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: field.start_position().row as u32,
+                character: field.start_position().column as u32,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: field.end_position().row as u32,
+                character: field.end_position().column as u32,
+            },
+        };
+
+        Some((
+            format!("Encapsulate field '{}'", field_name),
+            range,
+            new_field_decl,
+        ))
+    }
+
+    /// Generate "Convert for-loop to forEach()" refactoring
+    pub fn generate_convert_for_to_foreach(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut for_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "enhanced_for_statement" {
+                for_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let for_stmt = for_node?;
+        let name_node = for_stmt.child_by_field_name("name")?;
+        let var_name = self.node_text(&name_node);
+        let val_node = for_stmt.child_by_field_name("value")?;
+        let collection_name = self.node_text(&val_node);
+        let body_node = for_stmt.child_by_field_name("body")?;
+        let body_text = self.node_text(&body_node);
+
+        let new_code = format!("{}.forEach({} -> {});", collection_name, var_name, body_text);
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: for_stmt.start_position().row as u32,
+                character: for_stmt.start_position().column as u32,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: for_stmt.end_position().row as u32,
+                character: for_stmt.end_position().column as u32,
+            },
+        };
+
+        Some(("Convert for-loop to forEach()".to_string(), range, new_code))
+    }
+
+    /// Generate "Use 'var'" or "Replace 'var' with explicit type" refactoring
+    pub fn generate_use_var_refactoring(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut var_decl_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "local_variable_declaration" {
+                var_decl_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let var_decl = var_decl_node?;
+        let type_node = var_decl.child_by_field_name("type")?;
+        let type_text = self.node_text(&type_node);
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: type_node.start_position().row as u32,
+                character: type_node.start_position().column as u32,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: type_node.end_position().row as u32,
+                character: type_node.end_position().column as u32,
+            },
+        };
+
+        if type_text == "var" {
+            // Find initializer value to infer explicit type
+            let mut val_type = "Object";
+            let mut cursor = var_decl.walk();
+            for child in var_decl.children(&mut cursor) {
+                if child.kind() == "variable_declarator" {
+                    if let Some(val_n) = child.child_by_field_name("value") {
+                        val_type = match val_n.kind() {
+                            "object_creation_expression" => {
+                                val_n.child_by_field_name("type").map(|t| self.node_text(&t)).unwrap_or("Object")
+                            }
+                            "string_literal" => "String",
+                            "decimal_integer_literal" => "int",
+                            "decimal_floating_point_literal" => "double",
+                            "true" | "false" => "boolean",
+                            _ => "Object",
+                        };
+                    }
+                }
+            }
+            Some((
+                format!("Replace 'var' with explicit type '{}'", val_type),
+                range,
+                val_type.to_string(),
+            ))
+        } else {
+            Some(("Use 'var' for local variable declaration".to_string(), range, "var".to_string()))
+        }
+    }
+
+    /// Generate "Remove redundant cast" QuickFix
+    pub fn generate_remove_redundant_cast(
+        &self,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, tower_lsp::lsp_types::Range, String)> {
+        let root = self.tree.root_node();
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: col as usize,
+        };
+        let node = root.descendant_for_point_range(point, point);
+
+        let mut curr = node;
+        let mut cast_node = None;
+        while let Some(n) = curr {
+            if n.kind() == "cast_expression" {
+                cast_node = Some(n);
+                break;
+            }
+            curr = n.parent();
+        }
+
+        let cast = cast_node?;
+        let value_node = cast.child_by_field_name("value")?;
+        let value_text = self.node_text(&value_node);
+
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: cast.start_position().row as u32,
+                character: cast.start_position().column as u32,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: cast.end_position().row as u32,
+                character: cast.end_position().column as u32,
+            },
+        };
+
+        Some(("Remove redundant cast".to_string(), range, value_text.to_string()))
+    }
+
     /// Extract Inlay Hints for variable type hints in this AST (e.g. Java 10+ var x = ...): returns (Position, label)
     pub fn find_inlay_hints(&self) -> Vec<(Position, String)> {
+        self.find_inlay_hints_in_range(None)
+    }
+
+    /// Find type hints (e.g. for Java 10+ 'var') optionally restricted to a specific viewport range
+    pub fn find_inlay_hints_in_range(&self, range: Option<&Range>) -> Vec<(Position, String)> {
         let mut hints = Vec::new();
         let root = self.tree.root_node();
 
-        fn traverse(node: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<(Position, String)>) {
+        fn traverse(node: tree_sitter::Node, ast: &JavaAst, range: Option<&Range>, out: &mut Vec<(Position, String)>) {
+            if let Some(r) = range {
+                let start_row = node.start_position().row as u32;
+                let end_row = node.end_position().row as u32;
+                if end_row < r.start.line || start_row > r.end.line {
+                    return;
+                }
+            }
+
             // Type hints for Java 10+ 'var' declarations: e.g. var x = new ArrayList<>(); -> x: ArrayList
             if node.kind() == "local_variable_declaration" {
                 if let Some(type_n) = node.child_by_field_name("type") {
@@ -3850,7 +5270,14 @@ impl JavaAst {
                                         line: end.row as u32,
                                         character: ast.byte_col_to_utf16(end.row as u32, end.column),
                                     };
-                                    out.push((pos, format!(": {}", inferred)));
+                                    let in_range = if let Some(r) = range {
+                                        pos.line >= r.start.line && pos.line <= r.end.line
+                                    } else {
+                                        true
+                                    };
+                                    if in_range {
+                                        out.push((pos, format!(": {}", inferred)));
+                                    }
                                 }
                             }
                         }
@@ -3860,20 +5287,33 @@ impl JavaAst {
 
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                traverse(child, ast, out);
+                traverse(child, ast, range, out);
             }
         }
 
-        traverse(root, self, &mut hints);
+        traverse(root, self, range, &mut hints);
         hints
     }
 
     /// Find method invocations and the positions of their arguments to resolve real parameter inlay hints
     pub fn find_method_invocation_arg_positions(&self) -> Vec<InvocationArgInfo> {
+        self.find_method_invocation_arg_positions_in_range(None)
+    }
+
+    /// Find method invocations and the positions of their arguments optionally restricted to a specific viewport range
+    pub fn find_method_invocation_arg_positions_in_range(&self, range: Option<&Range>) -> Vec<InvocationArgInfo> {
         let mut results = Vec::new();
         let root = self.tree.root_node();
 
-        fn traverse(node: tree_sitter::Node, ast: &JavaAst, out: &mut Vec<InvocationArgInfo>) {
+        fn traverse(node: tree_sitter::Node, ast: &JavaAst, range: Option<&Range>, out: &mut Vec<InvocationArgInfo>) {
+            if let Some(r) = range {
+                let start_row = node.start_position().row as u32;
+                let end_row = node.end_position().row as u32;
+                if end_row < r.start.line || start_row > r.end.line {
+                    return;
+                }
+            }
+
             if node.kind() == "method_invocation" {
                 if let (Some(name_n), Some(args_node)) = (
                     node.child_by_field_name("name"),
@@ -3899,25 +5339,32 @@ impl JavaAst {
                             line: start.row as u32,
                             character: ast.byte_col_to_utf16(start.row as u32, start.column),
                         };
-                        out.push(InvocationArgInfo {
-                            receiver_steps: steps.clone(),
-                            receiver_raw: recv_raw.clone(),
-                            method_name: m_name.clone(),
-                            arg_index: idx,
-                            total_args: total,
-                            position: pos,
-                        });
+                        let in_range = if let Some(r) = range {
+                            pos.line >= r.start.line && pos.line <= r.end.line
+                        } else {
+                            true
+                        };
+                        if in_range {
+                            out.push(InvocationArgInfo {
+                                receiver_steps: steps.clone(),
+                                receiver_raw: recv_raw.clone(),
+                                method_name: m_name.clone(),
+                                arg_index: idx,
+                                total_args: total,
+                                position: pos,
+                            });
+                        }
                     }
                 }
             }
 
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                traverse(child, ast, out);
+                traverse(child, ast, range, out);
             }
         }
 
-        traverse(root, self, &mut results);
+        traverse(root, self, range, &mut results);
         results
     }
 
@@ -5258,6 +6705,83 @@ pub fn find_target_line_in_source(content: &str, target_name: &str) -> u32 {
     JavaAst::find_target_line_in_source(content, target_name)
 }
 
+/// Check if a string is a valid Java identifier (and not a Java keyword or literal)
+pub fn is_valid_java_identifier(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_alphabetic() && first != '_' && first != '$' {
+        return false;
+    }
+    if !chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+        return false;
+    }
+    !is_java_keyword(s)
+}
+
+/// Check if a string is a reserved Java keyword or boolean/null literal
+pub fn is_java_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "abstract"
+            | "assert"
+            | "boolean"
+            | "break"
+            | "byte"
+            | "case"
+            | "catch"
+            | "char"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "extends"
+            | "final"
+            | "finally"
+            | "float"
+            | "for"
+            | "goto"
+            | "if"
+            | "implements"
+            | "import"
+            | "instanceof"
+            | "int"
+            | "interface"
+            | "long"
+            | "native"
+            | "new"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "short"
+            | "static"
+            | "strictfp"
+            | "super"
+            | "switch"
+            | "synchronized"
+            | "this"
+            | "throw"
+            | "throws"
+            | "transient"
+            | "try"
+            | "void"
+            | "volatile"
+            | "while"
+            | "true"
+            | "false"
+            | "null"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6086,6 +7610,62 @@ class Demo {
         let diags = ast.collect_semantic_diagnostics_detailed(Some("Demo"));
         let missing_ret: Vec<_> = diags.iter().filter(|d| d.code == DiagnosticCode::MissingReturn).collect();
         assert!(missing_ret.is_empty(), "Should NOT report missing return when switch or try covers all cases! Found: {:?}", missing_ret);
+    }
+
+    #[test]
+    fn test_new_refactorings_and_quickfixes() {
+        let code = r#"
+public class UserService {
+    public String role = "ADMIN";
+
+    public void process(java.util.List<String> items) {
+        String greeting = (String) "Hello";
+        var count = 42;
+        for (String item : items) {
+            System.out.println(item);
+        }
+    }
+}
+"#;
+        let ast = JavaAst::parse(Arc::new(code.to_string())).unwrap();
+
+        // 1. Extract Interface
+        let iface = ast.generate_extract_interface(1, 14);
+        assert!(iface.is_some());
+        let (title, _, code_gen) = iface.unwrap();
+        assert!(title.contains("IUserService"));
+        assert!(code_gen.contains("public interface IUserService"));
+
+        // 2. Encapsulate Field
+        let encap = ast.generate_encapsulate_field(2, 18);
+        assert!(encap.is_some());
+        let (title, _, code_gen) = encap.unwrap();
+        assert!(title.contains("role"));
+        assert!(code_gen.contains("private String role"));
+        assert!(code_gen.contains("getRole()"));
+        assert!(code_gen.contains("setRole("));
+
+        // 3. Remove Redundant Cast
+        let cast = ast.generate_remove_redundant_cast(5, 27);
+        assert!(cast.is_some());
+        let (title, _, code_gen) = cast.unwrap();
+        assert_eq!(title, "Remove redundant cast");
+        assert_eq!(code_gen, "\"Hello\"");
+
+        // 4. Use var / Replace var with explicit type
+        let use_var = ast.generate_use_var_refactoring(5, 9);
+        assert!(use_var.is_some());
+        assert_eq!(use_var.unwrap().2, "var");
+
+        let replace_var = ast.generate_use_var_refactoring(6, 9);
+        assert!(replace_var.is_some());
+        assert_eq!(replace_var.unwrap().2, "int");
+
+        // 5. Convert for-loop to forEach()
+        let for_each = ast.generate_convert_for_to_foreach(7, 9);
+        assert!(for_each.is_some());
+        let (_, _, code_gen) = for_each.unwrap();
+        assert!(code_gen.contains("items.forEach(item ->"));
     }
 }
 

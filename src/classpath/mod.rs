@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod class_reader;
 pub mod decompiler;
 pub mod descriptor;
@@ -16,10 +17,12 @@ use crate::model::{ClassInfo, ClassKind, MethodInfo, TypeSignature};
 pub struct ClasspathRegistry {
     /// Mapping from FQN (e.g. "java.lang.String") to ClassInfo
     classes: RwLock<HashMap<String, Arc<ClassInfo>>>,
-    /// Mapping from Simple Name (e.g. "String") to list of FQNs
-    simple_name_index: RwLock<HashMap<String, Vec<String>>>,
-    /// Mapping from FQN to list of source paths/jars (for conflict detection)
+    /// Mapping from Simple Name (e.g. "String") to list of ClassInfos
+    simple_name_index: RwLock<HashMap<String, Vec<Arc<ClassInfo>>>>,
+    /// Mapping from FQN to list of source paths/jars (only populated if conflicts exist)
     origins: RwLock<HashMap<String, Vec<String>>>,
+    /// Set of already loaded jar paths (avoid duplicate scanning & indexing)
+    loaded_jars: RwLock<std::collections::HashSet<std::path::PathBuf>>,
     /// Saved JDK Home directory (for src.zip lookup)
     jdk_home: RwLock<Option<std::path::PathBuf>>,
 }
@@ -30,34 +33,69 @@ impl ClasspathRegistry {
             classes: RwLock::new(HashMap::new()),
             simple_name_index: RwLock::new(HashMap::new()),
             origins: RwLock::new(HashMap::new()),
+            loaded_jars: RwLock::new(std::collections::HashSet::new()),
             jdk_home: RwLock::new(None),
         }
     }
 
     pub async fn register_class(&self, class: ClassInfo) {
-        let fqn = class.fqn.clone();
-        let simple_name = class.simple_name.clone();
-        let source_path = class.source_path.clone().unwrap_or_default();
-        let arc_class = Arc::new(class);
+        self.register_classes(vec![class]).await;
+    }
 
-        let mut classes = self.classes.write().await;
-        classes.insert(fqn.clone(), arc_class);
+    /// Batch register multiple classes with minimal lock contention
+    pub async fn register_classes(&self, new_classes: Vec<ClassInfo>) {
+        if new_classes.is_empty() {
+            return;
+        }
 
-        let mut s_idx = self.simple_name_index.write().await;
-        s_idx.entry(simple_name).or_default().push(fqn.clone());
+        let mut classes_guard = self.classes.write().await;
+        let mut s_idx_guard = self.simple_name_index.write().await;
+        let mut origins_guard = self.origins.write().await;
 
-        if !source_path.is_empty() {
-            let mut origins = self.origins.write().await;
-            let list = origins.entry(fqn).or_default();
-            if !list.contains(&source_path) {
-                list.push(source_path);
+        for class in new_classes {
+            let fqn = class.fqn.clone();
+            let simple_name = class.simple_name.clone();
+            let arc_class = Arc::new(class);
+
+            let old = classes_guard.insert(fqn.clone(), arc_class.clone());
+
+            // De-duplicate simple_name_index and store Arc<ClassInfo> directly (0 redundant FQN strings)
+            let s_list = s_idx_guard.entry(simple_name).or_default();
+            if let Some(pos) = s_list.iter().position(|c| c.fqn == fqn) {
+                s_list[pos] = arc_class.clone();
+            } else {
+                s_list.push(arc_class.clone());
+            }
+
+            // Only track origins when a REAL multi-jar conflict occurs (saving ~99% origin heap memory)
+            if let Some(prev) = old {
+                if let (Some(prev_sp), Some(cur_sp)) = (&prev.source_path, &arc_class.source_path) {
+                    if prev_sp != cur_sp {
+                        let list = origins_guard.entry(fqn).or_default();
+                        if !list.contains(prev_sp) {
+                            list.push(prev_sp.clone());
+                        }
+                        if !list.contains(cur_sp) {
+                            list.push(cur_sp.clone());
+                        }
+                    }
+                }
             }
         }
     }
 
     pub async fn get_class_origins(&self, fqn: &str) -> Vec<String> {
         let origins = self.origins.read().await;
-        origins.get(fqn).cloned().unwrap_or_default()
+        if let Some(list) = origins.get(fqn) {
+            return list.clone();
+        }
+        let classes = self.classes.read().await;
+        if let Some(cls) = classes.get(fqn) {
+            if let Some(ref sp) = cls.source_path {
+                return vec![sp.clone()];
+            }
+        }
+        Vec::new()
     }
 
     pub async fn get_class(&self, fqn: &str) -> Option<Arc<ClassInfo>> {
@@ -80,12 +118,9 @@ impl ClasspathRegistry {
 
     pub async fn find_classes_by_simple_name(&self, simple_name: &str) -> Vec<Arc<ClassInfo>> {
         let s_idx = self.simple_name_index.read().await;
-        let classes = self.classes.read().await;
+        let mut res = s_idx.get(simple_name).cloned().unwrap_or_default();
+        drop(s_idx);
 
-        let mut res = Vec::new();
-        if let Some(fqns) = s_idx.get(simple_name) {
-            res.extend(fqns.iter().filter_map(|fqn| classes.get(fqn).cloned()));
-        }
         if res.is_empty() {
             if let Some(builtin) = get_builtin_framework_class_by_simple_name(simple_name) {
                 res.push(Arc::new(builtin));
@@ -116,16 +151,52 @@ impl ClasspathRegistry {
             || classes.contains_key("java.io.File")
     }
 
-    /// Load all classes from a jar file
+    /// Load all classes from a jar file (with global multi-project disk caching)
     pub async fn add_jar<P: AsRef<Path>>(&self, jar_path: P) -> Result<usize, String> {
-        let path_str = jar_path.as_ref().display().to_string();
-        info!("Loading jar: {}", path_str);
-        let parsed = parse_jar_file(&jar_path)?;
-        let count = parsed.len();
-        for cls in parsed {
-            self.register_class(cls).await;
+        let p = jar_path.as_ref();
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        {
+            let mut loaded = self.loaded_jars.write().await;
+            if !loaded.insert(canonical) {
+                // Jar already loaded into classpath, skip redundant parsing & duplicate memory allocation
+                return Ok(0);
+            }
         }
-        info!("Loaded {} classes from {}", count, path_str);
+
+        let path_str = p.display().to_string();
+
+        let global_cache_file = crate::classpath::cache::compute_jar_cache_key(p).map(|key| {
+            let dir = crate::classpath::cache::global_jar_cache_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join(key)
+        });
+
+        // 1. Try fast warm-load from global jar cache
+        if let Some(ref cf) = global_cache_file {
+            if cf.exists() {
+                if let Ok(classes) = crate::classpath::cache::load_archive_file(cf) {
+                    if !classes.is_empty() {
+                        let count = classes.len();
+                        self.register_classes(classes).await;
+                        info!("Fast-loaded {} classes for {} from global jar cache", count, path_str);
+                        return Ok(count);
+                    }
+                }
+            }
+        }
+
+        // 2. Cache miss: parse raw jar file
+        info!("Loading jar: {}", path_str);
+        let parsed = parse_jar_file(p)?;
+        let count = parsed.len();
+
+        // 3. Persist to global jar cache for instant cross-project warm starts
+        if let Some(ref cf) = global_cache_file {
+            let _ = crate::classpath::cache::save_archive_file(cf, &parsed);
+        }
+
+        self.register_classes(parsed).await;
+        info!("Loaded and cached {} classes from {}", count, path_str);
         Ok(count)
     }
 
@@ -193,10 +264,16 @@ impl ClasspathRegistry {
                     mtime.hash(&mut hasher);
                 }
             }
-            let cache_key = format!("jdk_{:016x}.json", hasher.finish());
-            let cache_file = cache_dir.join(cache_key);
+            let cache_key = format!("jdk_v3_{:016x}.bin.zst", hasher.finish());
+            let legacy_key = format!("jdk_{:016x}.json", hasher.finish());
+            let cache_file = cache_dir.join(&cache_key);
+            let legacy_file = cache_dir.join(&legacy_key);
+            if legacy_file.exists() {
+                // Remove obsolete uncompressed legacy JSON cache that consumed 100MB+ disk and 500MB+ heap
+                let _ = std::fs::remove_file(&legacy_file);
+            }
 
-            // Fast warm start from disk cache
+            // Fast warm start from binary compressed disk cache
             if cache_file.exists() {
                 if let Ok(loaded) = self.load_cache(&cache_file).await {
                     if loaded > 0 {
@@ -206,7 +283,7 @@ impl ClasspathRegistry {
                 }
             }
 
-            // Strategy A: jimage CLI tool (extract standard java.* modules)
+            // Strategy A: jimage CLI tool (extract standard public java.* packages across all modules)
             let jimage_bin = path.join("bin").join(if cfg!(windows) { "jimage.exe" } else { "jimage" });
             if jimage_bin.exists() {
                 info!("Using JDK jimage tool at {:?}", jimage_bin);
@@ -216,7 +293,7 @@ impl ClasspathRegistry {
                 let extract_res = tokio::process::Command::new(&jimage_bin)
                     .arg("extract")
                     .arg("--include")
-                    .arg("glob:/java.*/**")
+                    .arg("glob:/java.*/java/**")
                     .arg("--dir")
                     .arg(&temp_extract_dir)
                     .arg(&modules_path)
@@ -227,9 +304,7 @@ impl ClasspathRegistry {
                     if output.status.success() {
                         if let Ok(parsed_classes) = crate::classpath::class_reader::parse_class_dir(&temp_extract_dir) {
                             let count = parsed_classes.len();
-                            for cls in parsed_classes {
-                                self.register_class(cls).await;
-                            }
+                            self.register_classes(parsed_classes).await;
                             info!("Loaded {} JDK classes from extracted modules", count);
                             let _ = self.save_cache(&cache_file).await;
                             let _ = std::fs::remove_dir_all(&temp_extract_dir);
@@ -248,9 +323,7 @@ impl ClasspathRegistry {
                 info!("Fallback: indexing JDK from src.zip at {:?}", src_zip);
                 if let Ok(classes) = crate::classpath::class_reader::parse_src_zip(&src_zip) {
                     let count = classes.len();
-                    for cls in classes {
-                        self.register_class(cls).await;
-                    }
+                    self.register_classes(classes).await;
                     info!("Loaded {} JDK classes from src.zip", count);
                     let _ = self.save_cache(&cache_file).await;
                     return Ok(count);
@@ -263,9 +336,7 @@ impl ClasspathRegistry {
         if src_zip_alt.exists() {
             if let Ok(classes) = crate::classpath::class_reader::parse_src_zip(&src_zip_alt) {
                 let count = classes.len();
-                for cls in classes {
-                    self.register_class(cls).await;
-                }
+                self.register_classes(classes).await;
                 return Ok(count);
             }
         }
@@ -273,34 +344,72 @@ impl ClasspathRegistry {
         Ok(0)
     }
 
-    /// Persist the in-memory registry to a binary disk cache file for instant startup
-    pub async fn save_cache<P: AsRef<Path>>(&self, cache_file: P) -> Result<usize, String> {
+    /// Persist project dependency classes (excluding JDK classes) to workspace disk cache
+    pub async fn save_workspace_cache<P: AsRef<Path>>(&self, cache_file: P) -> Result<usize, String> {
+        let p = cache_file.as_ref();
         let classes = self.classes.read().await;
-        let list: Vec<ClassInfo> = classes.values().map(|c| (**c).clone()).collect();
-        let count = list.len();
+        let project_classes: Vec<&ClassInfo> = classes
+            .values()
+            .map(|c| c.as_ref())
+            .filter(|c| {
+                if let Some(ref sp) = c.source_path {
+                    // Only save classes that came from project jars (avoid duplicating JDK in workspace cache)
+                    sp.ends_with(".jar") && !sp.contains("rt.jar") && !sp.contains("classes.jar")
+                } else {
+                    false
+                }
+            })
+            .collect();
+        let count = project_classes.len();
 
-        let json_bytes = serde_json::to_vec(&list).map_err(|e| format!("Serialization error: {e}"))?;
-        if let Some(parent) = cache_file.as_ref().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(&cache_file, json_bytes).map_err(|e| format!("Disk write error: {e}"))?;
-        info!("Saved {} classes to persistent index cache: {:?}", count, cache_file.as_ref());
+        crate::classpath::cache::save_archive_file_from_refs(p, project_classes, count)?;
+        info!("Saved {} project dependency classes to workspace index cache: {:?}", count, p);
         Ok(count)
     }
 
-    /// Load pre-indexed classes from disk cache file
+    /// Persist the in-memory registry to a binary compressed disk cache file for instant startup
+    pub async fn save_cache<P: AsRef<Path>>(&self, cache_file: P) -> Result<usize, String> {
+        let p = cache_file.as_ref();
+        let classes = self.classes.read().await;
+        let count = classes.len();
+
+        crate::classpath::cache::save_archive_file_from_refs(p, classes.values().map(|c| c.as_ref()), count)?;
+        info!("Saved {} classes to persistent index cache: {:?}", count, p);
+        Ok(count)
+    }
+
+    /// Load pre-indexed classes from disk cache file (supports compact .bin.zst, .bin, and legacy .json)
     pub async fn load_cache<P: AsRef<Path>>(&self, cache_file: P) -> Result<usize, String> {
         let p = cache_file.as_ref();
-        if !p.exists() {
-            return Ok(0);
-        }
-        let data = std::fs::read(p).map_err(|e| format!("Disk read error: {e}"))?;
-        let list: Vec<ClassInfo> = serde_json::from_slice(&data).map_err(|e| format!("Deserialization error: {e}"))?;
+
+        // If file doesn't exist directly, check alternatives (.bin.zst vs .json)
+        let resolved_path = if p.exists() {
+            p.to_path_buf()
+        } else {
+            let str_path = p.to_string_lossy();
+            if str_path.ends_with(".bin.zst") {
+                let alt = std::path::PathBuf::from(str_path.trim_end_matches(".bin.zst").to_string() + ".json");
+                if alt.exists() {
+                    alt
+                } else {
+                    return Ok(0);
+                }
+            } else if str_path.ends_with(".json") {
+                let alt = std::path::PathBuf::from(str_path.trim_end_matches(".json").to_string() + ".bin.zst");
+                if alt.exists() {
+                    alt
+                } else {
+                    return Ok(0);
+                }
+            } else {
+                return Ok(0);
+            }
+        };
+
+        let list = crate::classpath::cache::load_archive_file(&resolved_path)?;
         let count = list.len();
-        for cls in list {
-            self.register_class(cls).await;
-        }
-        info!("Loaded {} classes from persistent index cache: {:?}", count, p);
+        self.register_classes(list).await;
+        info!("Loaded {} classes from persistent index cache: {:?}", count, resolved_path);
         Ok(count)
     }
 }
@@ -560,6 +669,9 @@ pub fn get_builtin_jdk_class(fqn: &str) -> Option<ClassInfo> {
     }
 
     let simple_name = fqn.rsplit('.').next().unwrap_or(fqn).to_string();
+    if !crate::syntax::is_valid_java_identifier(&simple_name) {
+        return None;
+    }
     if simple_name.is_empty() || !simple_name.chars().next().unwrap_or(' ').is_uppercase() || simple_name.contains('_') {
         return None;
     }
@@ -760,6 +872,52 @@ pub fn is_known_framework_or_library_class(imp: &str) -> bool {
         "io.swagger.",
         "feign.",
         "org.hibernate.",
+        "io.micrometer.",
+        "io.netty.",
+        "io.reactivex.",
+        "reactor.",
+        "redis.clients.jedis.",
+        "org.redisson.",
+        "com.zaxxer.hikari.",
+        "org.quartz.",
+        "org.mapstruct.",
+        "com.mongodb.",
+        "org.elasticsearch.",
+        "org.opensearch.",
+        "io.grpc.",
+        "com.squareup.okhttp3.",
+        "okhttp3.",
+        "io.undertow.",
+        "org.eclipse.jetty.",
+        "org.apache.catalina.",
+        "org.apache.tomcat.",
+        "org.apache.curator.",
+        "org.apache.zookeeper.",
+        "org.apache.shardingsphere.",
+        "com.github.benmanes.caffeine.",
+        "org.assertj.",
+        "org.hamcrest.",
+        "org.json.",
+        "io.jsonwebtoken.",
+        "com.auth0.jwt.",
+        "com.squareup.retrofit2.",
+        "retrofit2.",
+        "com.google.protobuf.",
+        "org.apache.thrift.",
+        "org.apache.avro.",
+        "io.minio.",
+        "com.aliyun.oss.",
+        "com.qcloud.cos.",
+        "org.yaml.snakeyaml.",
+        "com.netflix.",
+        "org.aspectj.",
+        "ch.qos.logback.",
+        "org.apache.logging.",
+        "io.github.resilience4j.",
+        "com.alibaba.csp.sentinel.",
+        "com.github.pagehelper.",
+        "io.lettuce.core.",
+        "com.rabbitmq.",
     ];
     FRAMEWORK_PREFIXES.iter().any(|prefix| imp.starts_with(prefix))
 }
@@ -771,6 +929,9 @@ pub fn get_builtin_framework_class(fqn: &str) -> Option<ClassInfo> {
     }
 
     let simple_name = fqn.rsplit('.').next().unwrap_or(fqn).to_string();
+    if !crate::syntax::is_valid_java_identifier(&simple_name) {
+        return None;
+    }
     let package_name = if let Some(idx) = fqn.rfind('.') {
         fqn[..idx].to_string()
     } else {
@@ -1140,6 +1301,180 @@ mod tests {
         println!("get_class(File) = {:?}", reg.get_class("java.io.File").await.is_some());
         println!("get_class(ArrayList) = {:?}", reg.get_class("java.util.ArrayList").await.is_some());
         println!("get_class(Collection) = {:?}", reg.get_class("java.util.Collection").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_measure_actual_rss_footprint() {
+        fn get_rss_kb() -> usize {
+            let pid = std::process::id();
+            let out = std::process::Command::new("ps")
+                .arg("-o")
+                .arg("rss=")
+                .arg("-p")
+                .arg(pid.to_string())
+                .output()
+                .expect("ps command");
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            s.parse::<usize>().unwrap_or(0)
+        }
+
+        let rss_start = get_rss_kb();
+        let registry = ClasspathRegistry::new();
+        if let Some(jh) = find_java_home() {
+            let _ = registry.add_jdk_home(jh).await;
+        }
+        let rss_after_jdk = get_rss_kb();
+
+        // Also load all jars in ~/.jlsp/cache/jars
+        let jar_dir = crate::classpath::cache::global_jar_cache_dir();
+        if let Ok(entries) = std::fs::read_dir(&jar_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.to_string_lossy().ends_with(".bin.zst") {
+                    let _ = registry.load_cache(&p).await;
+                }
+            }
+        }
+        let rss_after_jars = get_rss_kb();
+        let class_count = registry.classes.read().await.len();
+
+        println!("=== RSS MEMORY MEASUREMENT ===");
+        println!("Start RSS: {:.2} MB", rss_start as f64 / 1024.0);
+        println!("After JDK RSS: {:.2} MB", rss_after_jdk as f64 / 1024.0);
+        println!("After Jars RSS: {:.2} MB (Total classes: {})", rss_after_jars as f64 / 1024.0, class_count);
+        println!("Net Memory Used: {:.2} MB", (rss_after_jars.saturating_sub(rss_start)) as f64 / 1024.0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_save_and_load_roundtrip() {
+        let temp_dir = std::env::temp_dir().join(format!("jlsp_test_cache_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cache_file = temp_dir.join("index.bin.zst");
+
+        let registry = ClasspathRegistry::new();
+        registry.register_class(ClassInfo {
+            fqn: "com.example.Service".to_string(),
+            simple_name: "Service".to_string(),
+            package_name: "com.example".to_string(),
+            kind: ClassKind::Class,
+            super_class: None,
+            interfaces: vec![],
+            methods: vec![],
+            fields: vec![],
+            source_path: Some("/path/to/lib.jar".to_string()),
+            is_public: true,
+        }).await;
+
+        let saved = registry.save_cache(&cache_file).await.expect("save should succeed");
+        assert_eq!(saved, 1);
+        assert!(cache_file.exists());
+
+        // Create new registry and load from disk
+        let new_registry = ClasspathRegistry::new();
+        let loaded = new_registry.load_cache(&cache_file).await.expect("load should succeed");
+        assert_eq!(loaded, 1);
+
+        let cls = new_registry.get_class("com.example.Service").await;
+        assert!(cls.is_some());
+        let cls = cls.unwrap();
+        assert_eq!(cls.simple_name, "Service");
+        assert_eq!(cls.package_name, "com.example");
+        assert_eq!(cls.source_path, Some("/path/to/lib.jar".to_string()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cache_legacy_json_fallback() {
+        let temp_dir = std::env::temp_dir().join(format!("jlsp_test_legacy_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let json_file = temp_dir.join("index.json");
+
+        let classes = vec![ClassInfo {
+            fqn: "com.example.OldClass".to_string(),
+            simple_name: "OldClass".to_string(),
+            package_name: "com.example".to_string(),
+            kind: ClassKind::Class,
+            super_class: None,
+            interfaces: vec![],
+            methods: vec![],
+            fields: vec![],
+            source_path: None,
+            is_public: true,
+        }];
+        std::fs::write(&json_file, serde_json::to_vec(&classes).unwrap()).unwrap();
+
+        let registry = ClasspathRegistry::new();
+        // Request index.bin.zst, should fallback to index.json transparently
+        let requested_bin = temp_dir.join("index.bin.zst");
+        let loaded = registry.load_cache(&requested_bin).await.expect("load should succeed");
+        assert_eq!(loaded, 1);
+        assert!(registry.get_class("com.example.OldClass").await.is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_memory_optimizations_and_deduplication() {
+        let registry = ClasspathRegistry::new();
+
+        // 1. Register a class from jar A
+        registry.register_class(ClassInfo {
+            fqn: "com.demo.Foo".to_string(),
+            simple_name: "Foo".to_string(),
+            package_name: "com.demo".to_string(),
+            kind: ClassKind::Class,
+            super_class: None,
+            interfaces: vec![],
+            methods: vec![],
+            fields: vec![],
+            source_path: Some("/libs/foo-1.0.jar".to_string()),
+            is_public: true,
+        }).await;
+
+        // Since it's unique, origins map should NOT allocate an entry
+        assert_eq!(registry.origins.read().await.len(), 0);
+        // But get_class_origins should still return its source path
+        assert_eq!(registry.get_class_origins("com.demo.Foo").await, vec!["/libs/foo-1.0.jar"]);
+
+        // 2. Register the same class again from the same jar (should NOT duplicate simple_name_index or origins)
+        registry.register_class(ClassInfo {
+            fqn: "com.demo.Foo".to_string(),
+            simple_name: "Foo".to_string(),
+            package_name: "com.demo".to_string(),
+            kind: ClassKind::Class,
+            super_class: None,
+            interfaces: vec![],
+            methods: vec![],
+            fields: vec![],
+            source_path: Some("/libs/foo-1.0.jar".to_string()),
+            is_public: true,
+        }).await;
+
+        let s_idx = registry.simple_name_index.read().await;
+        assert_eq!(s_idx.get("Foo").unwrap().len(), 1, "Simple name index must NOT contain duplicate FQNs!");
+        drop(s_idx);
+        assert_eq!(registry.origins.read().await.len(), 0, "No duplicate origin entry should exist!");
+
+        // 3. Register conflicting class from jar B -> Now origins should record the conflict
+        registry.register_class(ClassInfo {
+            fqn: "com.demo.Foo".to_string(),
+            simple_name: "Foo".to_string(),
+            package_name: "com.demo".to_string(),
+            kind: ClassKind::Class,
+            super_class: None,
+            interfaces: vec![],
+            methods: vec![],
+            fields: vec![],
+            source_path: Some("/libs/foo-2.0.jar".to_string()),
+            is_public: true,
+        }).await;
+
+        assert_eq!(registry.origins.read().await.len(), 1, "Conflict should now be recorded!");
+        let origins = registry.get_class_origins("com.demo.Foo").await;
+        assert_eq!(origins.len(), 2);
+        assert!(origins.contains(&"/libs/foo-1.0.jar".to_string()));
+        assert!(origins.contains(&"/libs/foo-2.0.jar".to_string()));
     }
 }
 
